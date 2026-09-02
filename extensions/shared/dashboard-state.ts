@@ -13,6 +13,10 @@ export interface ModelInfoState {
   cost: number;
   tokensPerSecond: number | null;
   generating: boolean;
+  /** Short summary of what the session is about, derived from the first message. */
+  summary: string | null;
+  /** True while the summary is being generated (after the first response). */
+  summarizing: boolean;
 }
 
 export interface PullRequestInfo {
@@ -40,6 +44,8 @@ export function emptyModelInfoState(): ModelInfoState {
     cost: 0,
     tokensPerSecond: null,
     generating: false,
+    summary: null,
+    summarizing: false,
   };
 }
 
@@ -73,7 +79,9 @@ export function isModelInfoState(value: unknown): value is ModelInfoState {
     isNullableNumber(value.contextPercent) &&
     typeof value.cost === "number" &&
     isNullableNumber(value.tokensPerSecond) &&
-    typeof value.generating === "boolean"
+    typeof value.generating === "boolean" &&
+    (value.summary === null || typeof value.summary === "string") &&
+    typeof value.summarizing === "boolean"
   );
 }
 
