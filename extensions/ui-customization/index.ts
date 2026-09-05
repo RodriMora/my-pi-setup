@@ -20,6 +20,7 @@ import {
   isGitInfoState,
   isModelInfoState,
 } from "../shared/dashboard-state.ts";
+import { createFullscreenScrollOverride } from "./src/fullscreen-scroll.ts";
 
 type Rgb = [number, number, number];
 interface RenderableNode {
@@ -185,6 +186,7 @@ function columns(left: string, right: string, width: number) {
 }
 
 export default function uiCustomization(pi: ExtensionAPI) {
+  const fullscreenScroll = createFullscreenScrollOverride();
   let title = "pi";
   let modelInfo = emptyModelInfoState();
   let gitInfo = emptyGitInfoState();
@@ -222,6 +224,7 @@ export default function uiCustomization(pi: ExtensionAPI) {
 
     ctx.ui.setHeader((tui) => {
       activeTui = tui;
+      fullscreenScroll.apply(tui);
       requestRender = () => tui.requestRender();
       scheduleThemeRemoval(tui);
 
@@ -246,6 +249,8 @@ export default function uiCustomization(pi: ExtensionAPI) {
       return {
         invalidate() {},
         render(width: number) {
+          // Reapply when /settings replaces the renderer on a TUI mode switch.
+          fullscreenScroll.apply(tui);
           const directory = theme.fg("text", formatDirectory(ctx.cwd));
           const fileLabel = gitInfo.changedFiles === 1 ? "file" : "files";
           let git = gitInfo.branch
@@ -317,6 +322,7 @@ export default function uiCustomization(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
+    fullscreenScroll.dispose(activeTui);
     stopModelListener();
     stopGitListener();
     for (const timer of themeRemovalTimers) clearTimeout(timer);

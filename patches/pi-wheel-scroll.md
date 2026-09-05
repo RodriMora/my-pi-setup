@@ -1,4 +1,9 @@
-# pi fullscreen wheel-scroll = 5 lines
+# pi fullscreen wheel-scroll = 5 lines (legacy patch)
+
+> Superseded by the `ui-customization` extension's runtime override. Use `/reload`
+> to activate it; do not run `apply.sh` for new Pi installs/updates. The extension
+> changes the live renderer, so it works with bundled Pi without editing package
+> files. The notes and script below are retained only as historical reference.
 
 ## What
 
