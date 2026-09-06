@@ -114,7 +114,7 @@ export default function modelInfo(pi: ExtensionAPI) {
 
   /**
    * Pick which model produces the session summary, based on the active model:
-   * - any gpt-5.x model        -> openai/gpt-5.6-luna with low reasoning
+   * - any gpt-5.x model        -> the active model with low reasoning
    * - babel-litellm/Babel-LLM  -> the active model itself
    * - local-dgx/*              -> the active model itself
    */
@@ -125,17 +125,7 @@ export default function modelInfo(pi: ExtensionAPI) {
     if (!main) return undefined;
 
     if (isGptModel(main)) {
-      const luna = ctx.modelRegistry
-        .getAll()
-        .find(
-          (m) =>
-            m.id === "openai/gpt-5.6-luna" ||
-            (m.provider === "openrouter" && /gpt-5\.6-luna$/i.test(m.id)),
-        );
-      if (luna && ctx.modelRegistry.hasConfiguredAuth(luna)) {
-        return { model: luna, reasoningEffort: "low" };
-      }
-      // Fallback: summarize with the active gpt model itself, still low reasoning.
+      // Keep summaries on the active model's provider and credentials.
       if (ctx.modelRegistry.hasConfiguredAuth(main)) {
         return { model: main, reasoningEffort: "low" };
       }
