@@ -1,3 +1,4 @@
+import { appendFileSync } from "node:fs";
 import { uuidv7 } from "@earendil-works/pi-ai";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type {
@@ -15,6 +16,16 @@ const LIVE_UPDATE_INTERVAL_MS = 200;
 const FIRST_MESSAGE_CHAR_LIMIT = 8_000;
 const ASSISTANT_CONTEXT_CHAR_LIMIT = 4_000;
 const SUMMARY_CHAR_LIMIT = 39;
+const SUMMARY_MAX_TOKENS = 2048;
+const SUMMARY_LOG = "/tmp/pi-summary.log";
+
+function logSummaryError(message: string) {
+  try {
+    appendFileSync(SUMMARY_LOG, `${new Date().toISOString()} ${message}\n`);
+  } catch {
+    // Logging must never break the extension.
+  }
+}
 
 // Topic titles, rather than completion reports, inspired by T3 Code's
 // apps/server/src/textGeneration/TextGenerationPrompts.ts.
@@ -161,6 +172,51 @@ export default function modelInfo(pi: ExtensionAPI) {
       : undefined;
   }
 
+  async function completeSummary(
+    ctx: ExtensionContext,
+    target: { model: Model<Api>; reasoningEffort?: "low" },
+    userText: string,
+    assistantText: string | null,
+    signal: AbortSignal,
+  ) {
+    return ctx.modelRegistry.complete(
+      target.model,
+      {
+        systemPrompt: SUMMARY_SYSTEM_PROMPT,
+        messages: [
+          {
+            role: "user" as const,
+            content: [
+              {
+                type: "text" as const,
+                text: `USER REQUEST:\n${userText.slice(0, FIRST_MESSAGE_CHAR_LIMIT)}`,
+              },
+              ...(assistantText
+                ? [
+                    {
+                      type: "text" as const,
+                      text: `ASSISTANT CONTEXT (clarification only, not the title's focus):\n${assistantText.slice(0, ASSISTANT_CONTEXT_CHAR_LIMIT)}`,
+                    },
+                  ]
+                : []),
+            ],
+            timestamp: Date.now(),
+          },
+        ],
+      },
+      {
+        // Reasoning tokens count against this budget on thinking models, so it
+        // must be generous: a tight cap can be exhausted by thinking alone,
+        // leaving stopReason=length with no text and therefore no summary.
+        maxTokens: SUMMARY_MAX_TOKENS,
+        ...(target.reasoningEffort ? { reasoningEffort: target.reasoningEffort } : {}),
+        cacheRetention: "none",
+        sessionId: uuidv7(),
+        signal,
+      },
+    );
+  }
+
   async function generateSummary(ctx: ExtensionContext) {
     const controller = new AbortController();
     summaryAbort = controller;
@@ -170,61 +226,61 @@ export default function modelInfo(pi: ExtensionAPI) {
     try {
       const target = resolveSummaryModel(ctx);
       if (!target) {
+        logSummaryError(`no summary model for ${ctx.model?.provider}/${ctx.model?.id}`);
         state = { ...state, summarizing: false };
         return;
       }
 
       const lastAssistantText = getLastAssistantText(ctx);
+      const firstMessage = firstMessageText!;
 
-      const response = await ctx.modelRegistry.complete(
-        target.model,
-        {
-          systemPrompt: SUMMARY_SYSTEM_PROMPT,
-          messages: [
-            {
-              role: "user" as const,
-              content: [
-                {
-                  type: "text" as const,
-                  text: `USER REQUEST:\n${firstMessageText!.slice(0, FIRST_MESSAGE_CHAR_LIMIT)}`,
-                },
-                ...(lastAssistantText
-                  ? [
-                      {
-                        type: "text" as const,
-                        text: `ASSISTANT CONTEXT (clarification only, not the title's focus):\n${lastAssistantText.slice(0, ASSISTANT_CONTEXT_CHAR_LIMIT)}`,
-                      },
-                    ]
-                  : []),
-              ],
-              timestamp: Date.now(),
-            },
-          ],
-        },
-        {
-          maxTokens: 512,
-          ...(target.reasoningEffort
-            ? { reasoningEffort: target.reasoningEffort }
-            : {}),
-          cacheRetention: "none",
-          sessionId: uuidv7(),
-          signal: controller.signal,
-        },
-      );
-
-      const text = response.content
-        .filter((c): c is { type: "text"; text: string } => c.type === "text")
-        .map((c) => c.text)
-        .join(" ");
-
+      // Reasoning models can burn the token budget on thinking and return
+      // stopReason=length with empty text; providers can also hiccup. Retry
+      // with T3-Code-style exponential backoff (2 attempts more, 2s base).
+      let text = "";
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        if (attempt > 0) {
+          const delayMs = 2 ** attempt * 1000;
+          await new Promise<void>((resolve) => {
+            const timer = setTimeout(resolve, delayMs);
+            controller.signal.addEventListener(
+              "abort",
+              () => {
+                clearTimeout(timer);
+                resolve();
+              },
+              { once: true },
+            );
+          });
+          if (controller.signal.aborted) return;
+        }
+        const response = await completeSummary(
+          ctx,
+          target,
+          firstMessage,
+          lastAssistantText,
+          controller.signal,
+        );
+        text = response.content
+          .filter((c): c is { type: "text"; text: string } => c.type === "text")
+          .map((c) => c.text)
+          .join(" ");
+        if (text.trim()) break;
+        logSummaryError(
+          `empty summary response (attempt ${attempt + 1}, stopReason=${(response as { stopReason?: string }).stopReason ?? "unknown"}, errorMessage=${(response as { errorMessage?: string }).errorMessage ?? "n/a"}, model=${target.model.provider}/${target.model.id})`,
+        );
+      }
       state = {
         ...state,
         summarizing: false,
         summary: cleanSummary(text),
       };
-    } catch {
+    } catch (error) {
       // Failures (including aborts) are non-fatal: the footer just shows no summary.
       if (!controller.signal.aborted) {
+        logSummaryError(
+          `summary request failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
         state = { ...state, summarizing: false, summary: null };
       }
     } finally {
@@ -316,10 +372,14 @@ export default function modelInfo(pi: ExtensionAPI) {
     refresh(ctx);
   });
 
-  pi.on("message_start", (event) => {
+  pi.on("message_start", (event, ctx) => {
     if (event.message.role === "assistant") resetMessageTracking();
     if (event.message.role === "user" && firstMessageText === null) {
       firstMessageText = extractText(event.message.content);
+      // T3 Code generates the thread title from the first user prompt at turn
+      // start, concurrently with the agent's first response, so the title is
+      // ready without waiting for the reply to finish. Mirror that here.
+      if (firstMessageText !== null) requestSummary(ctx);
     }
   });
 
@@ -409,12 +469,17 @@ export default function modelInfo(pi: ExtensionAPI) {
 
   pi.on("turn_end", (_event, ctx) => refresh(ctx));
 
+  pi.on("turn_start", (_event, ctx) => {
+    // Fallback for flows where message_start did not capture the prompt
+    // (e.g. queued/injected messages). No-op once a summary was requested.
+    if (firstMessageText !== null) requestSummary(ctx);
+  });
+
   pi.on("agent_settled", (_event, ctx) => {
     state = { ...state, generating: false };
     refresh(ctx);
-    // The first prompt's turn (including tool calls) has fully settled:
-    // kick off the session summary in the background, using the first prompt
-    // and the final response, so we never add latency to the first reply.
+    // Last-resort trigger: normally the summary was already kicked off when
+    // the first user message arrived (see message_start / turn_start).
     if (firstMessageText !== null) requestSummary(ctx);
   });
 

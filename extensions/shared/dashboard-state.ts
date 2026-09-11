@@ -15,7 +15,7 @@ export interface ModelInfoState {
   generating: boolean;
   /** Short summary of what the session is about, derived from the first message. */
   summary: string | null;
-  /** True while the summary is being generated (after the first response). */
+  /** True while the summary is being generated (fires with the first user message). */
   summarizing: boolean;
 }
 
