@@ -18,6 +18,9 @@ const ASSISTANT_CONTEXT_CHAR_LIMIT = 4_000;
 const SUMMARY_CHAR_LIMIT = 39;
 const SUMMARY_MAX_TOKENS = 2048;
 const SUMMARY_LOG = "/tmp/pi-summary.log";
+// Deferred fallback kick for turns where no assistant delta was observed
+// (see turn_start). Long enough that the main request is already on the wire.
+const SUMMARY_FALLBACK_KICK_MS = 1_000;
 
 function logSummaryError(message: string) {
   try {
@@ -376,19 +379,25 @@ export default function modelInfo(pi: ExtensionAPI) {
     if (event.message.role === "assistant") resetMessageTracking();
     if (event.message.role === "user" && firstMessageText === null) {
       firstMessageText = extractText(event.message.content);
-      // T3 Code generates the thread title from the first user prompt at turn
-      // start, concurrently with the agent's first response, so the title is
-      // ready without waiting for the reply to finish. Mirror that here.
-      if (firstMessageText !== null) requestSummary(ctx);
+      // Deliberately NOT requesting the summary here. At user message_start
+      // the main agent request has not been sent yet; firing the summary now
+      // would let it reach a concurrency-limited server (e.g. local-dgx)
+      // first and delay the first response token. Instead the summary is
+      // kicked off from message_update once the main request is provably
+      // in flight, so it runs alongside (or queues behind) the response
+      // instead of ahead of it.
     }
   });
 
-  pi.on("message_update", (event) => {
+  pi.on("message_update", (event, ctx) => {
     if (event.message.role !== "assistant") return;
 
     const streamEvent = event.assistantMessageEvent;
     if (streamEvent.type === "toolcall_delta") {
       sawToolCall = true;
+      // First observed delta of any kind: the main request is on the wire,
+      // so the summary can be fired without racing ahead of it.
+      if (firstMessageText !== null) requestSummary(ctx);
       return;
     }
     if (
@@ -397,6 +406,8 @@ export default function modelInfo(pi: ExtensionAPI) {
     )
       return;
     if (!streamEvent.delta) return;
+
+    if (firstMessageText !== null) requestSummary(ctx);
 
     const now = Date.now();
     if (contentStreamStart === null) {
@@ -470,9 +481,13 @@ export default function modelInfo(pi: ExtensionAPI) {
   pi.on("turn_end", (_event, ctx) => refresh(ctx));
 
   pi.on("turn_start", (_event, ctx) => {
-    // Fallback for flows where message_start did not capture the prompt
-    // (e.g. queued/injected messages). No-op once a summary was requested.
-    if (firstMessageText !== null) requestSummary(ctx);
+    // Fallback for flows where no assistant delta triggers the summary (e.g.
+    // queued/injected messages). Deferred so the main request — which starts
+    // right after this event — still reaches the server first. No-op once a
+    // summary was requested.
+    if (firstMessageText === null || summaryRequested) return;
+    const kickTimer = setTimeout(() => requestSummary(ctx), SUMMARY_FALLBACK_KICK_MS);
+    kickTimer.unref?.();
   });
 
   pi.on("agent_settled", (_event, ctx) => {
