@@ -4,6 +4,7 @@ import {
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_LINES,
   formatSize,
+  truncateHead,
   truncateTail,
 } from "@earendil-works/pi-coding-agent";
 import { formatElapsed, formatExit, type TerminalSnapshot } from "./domain.ts";
@@ -27,6 +28,7 @@ export const BG_START_TOOL_DESCRIPTION =
   "Fire-and-forget: this returns immediately with an id, and you get a message with the final output when the process exits. " +
   "The process receives NO stdin (immediate EOF) and there is no way to send input later — interactive commands will not work; use bg_kill to stop a stuck one. " +
   `Terminals are session-scoped: they are killed when the session ends or reloads. Output shown to you is tail-truncated (stdout ${formatSize(STATUS_STDOUT_MAX)}, stderr ${formatSize(STATUS_STDERR_MAX)}); the full logs are captured to files and in the /ps viewer. ` +
+  "Keep child commands in the foreground: daemonized descendants that leave the owned process group may escape cleanup; Windows tree cleanup is best-effort. " +
   `Max ${MAX_RUNNING} background terminals can run at once.`;
 
 export const BG_START_PROMPT_SNIPPET =
@@ -56,7 +58,7 @@ export const BG_LIST_TOOL_DESCRIPTION =
   "List all background terminals (running and settled) with pid, elapsed time, exit status, and output sizes.";
 
 export const BG_KILL_TOOL_DESCRIPTION =
-  "Stop one or more running background terminals (SIGTERM to the whole process tree, escalating to SIGKILL). Returns each terminal's final state; already-settled ids are reported as such.";
+  "Stop one or more running background terminals (SIGTERM to the owned POSIX process group, escalating to SIGKILL; Windows uses best-effort taskkill /T). Returns each terminal's final state and bounded stdout/stderr tails; already-settled ids are reported as such. Total output is limited to 50KB/2000 lines; use bg_status or /ps for more output and log paths.";
 
 export const BG_KILL_PARAMETER_DESCRIPTIONS = {
   ids: 'Terminal ids to stop, e.g. ["bt-1"]',
@@ -99,7 +101,9 @@ function outputSection(
   if (truncation.truncated || view.truncatedBytes > 0) {
     const where = view.spillPath
       ? `Full log: ${view.spillPath}`
-      : "Full output in the /ps viewer";
+      : view.truncatedBytes > 0
+        ? "Only retained output is available in /ps; older output was not preserved"
+        : "More retained output in the /ps viewer";
     text += `\n[${label} truncated: showing last ${formatSize(shownBytes)} of ${formatSize(view.totalBytes)}. ${where}]`;
   }
   return text;
@@ -127,7 +131,8 @@ export function buildTerminalResultMessage(snap: TerminalSnapshot) {
 }
 
 export function buildKillReport(results: ReadonlyArray<KillResult>) {
-  return results
+  // Keep every terminal's status ahead of output, even when the aggregate truncates.
+  const summary = results
     .map((entry) => {
       if (entry.killed) {
         return `Killed ${entry.id} "${entry.title}" (${entry.exit}).`;
@@ -139,4 +144,31 @@ export function buildKillReport(results: ReadonlyArray<KillResult>) {
       return `${entry.id} "${entry.title}" was already ${entry.status} (${entry.exit}).`;
     })
     .join("\n");
+  const perTerminalBytes = Math.floor(32 * 1024 / Math.max(1, results.length));
+  const output = results
+    .flatMap((entry) => {
+      const snap = entry.snapshot;
+      if (!snap) return [];
+      const sections = [`\n\n${entry.id} final output:`];
+      if (snap.errorText) sections.push(`Error: ${snap.errorText}`);
+      sections.push(outputSection(
+        "stdout", snap.stdout,
+        Math.min(RESULT_STDOUT_MAX, Math.floor(perTerminalBytes * 2 / 3)),
+        RESULT_STDOUT_MAX_LINES,
+      ));
+      sections.push(outputSection(
+        "stderr", snap.stderr,
+        Math.min(RESULT_STDERR_MAX, Math.floor(perTerminalBytes / 3)),
+        RESULT_STDERR_MAX_LINES,
+      ));
+      return [sections.join("\n")];
+    })
+    .join("");
+  const notice =
+    "[Kill report truncated. Use bg_status or /ps for per-terminal output and full-log paths.]";
+  const truncated = truncateHead(summary + output, {
+    maxBytes: DEFAULT_MAX_BYTES - Buffer.byteLength(notice) - 2,
+    maxLines: DEFAULT_MAX_LINES - 2,
+  });
+  return truncated.truncated ? `${truncated.content}\n\n${notice}` : truncated.content;
 }

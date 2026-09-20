@@ -1,5 +1,10 @@
 # background-terminals — Implementation Guide
 
+> **Historical design notes:** see [the current README](../README.md) and source/tests
+> for current behavior. In particular, stdio closure no longer implies process-group
+> death, settlement follows scope cleanup, and kill interest only reserves delivery;
+> it does not consume a result before a successful tool response.
+
 > Research phase output. Updated 2026-07-24 against:
 > - `effect@4.0.0-beta.101` (verified installed in this package's `node_modules/effect`; the
 >   `unstable/process` module exists there but we deliberately do NOT use it — see §6)

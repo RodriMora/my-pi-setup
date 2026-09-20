@@ -4,8 +4,8 @@
  *
  * Each terminal is a raw `node:child_process` spawn (own process group on
  * POSIX, stdin ignored) whose stdout/stderr 'data' callbacks fold into two
- * bounded OutputBuffers. Closing a terminal's scope kills the whole process
- * tree (SIGTERM → SIGKILL escalation).
+ * bounded OutputBuffers. Closing a terminal's scope terminates its owned
+ * process group (SIGTERM → SIGKILL; best-effort tree cleanup on Windows).
  *
  * The manager also exposes a synchronous `TerminalReadModel` so the
  * imperative TUI components (which render synchronously) can read snapshots
@@ -34,6 +34,7 @@ import {
   type TerminalStatus,
 } from "./domain.ts";
 import { OutputBuffer } from "./output.ts";
+import { createProcessTree, type ProcessTree } from "./process-tree.ts";
 
 export const MAX_RUNNING = 8;
 export const MAX_TRACKED = 32;
@@ -45,8 +46,8 @@ export const MAX_SPILL_BYTES_PER_STREAM = 256 * 1024 * 1024;
 const STOP_TIMEOUT_MS = 5_000;
 /** SIGTERM is normally enough; the second deadline covers a wedged process. */
 const FORCE_KILL_AFTER_MS = 2_000;
-/** After termination, how long to wait for the natural close→flush→settle
- * path before force-settling (a grandchild can hold the stdio pipes open). */
+/** Natural stdio-drainage grace before cleanup, and after termination before
+ * closing our capture pipes (an escaped descendant may keep them open). */
 const SETTLE_GRACE_MS = 1_000;
 /** Bound on waiting for spill WriteStreams to flush before settling; a hung
  * filesystem must not leave an exited entry "running" (and kill() waiting).
@@ -92,15 +93,12 @@ interface Entry {
   processErrored: boolean;
   /** 'exit' event observed (code/signal recorded). */
   exited: boolean;
-  /** 'close' event observed (stdio flushed; the settle trigger). */
+  /** 'close' event observed (stdio flushed, not proof the group is dead). */
   stdioClosed: boolean;
-  /** A settle-after-spill-flush is in flight; don't start a second one. */
-  settling: boolean;
-  /** The shell exited without stdio closing; a bounded scope close is queued
-   * to reap descendants that still hold the inherited pipes open. */
+  /** Bounded scope closure has been queued after shell exit/spawn failure. */
   exitCleanupStarted: boolean;
-  /** Completed exactly once when the entry settles. Kill callers and the scope
-   * finalizer can all await the same result without missing a notification. */
+  /** Completed exactly once after scope cleanup. Concurrent kill callers can
+   * all await the same result without missing a notification. */
   settled: Deferred.Deferred<void>;
 }
 
@@ -122,6 +120,8 @@ export interface KillResult {
   /** Final exit rendering ("exit 0", "SIGTERM", ...) captured at settle time,
    * so reports stay accurate even if the entry is pruned afterwards. */
   readonly exit: string;
+  /** Final captured output, retained even if pruning races the tool boundary. */
+  readonly snapshot?: TerminalSnapshot;
 }
 
 // --- Read model ----------------------------------------------------------------
@@ -138,12 +138,11 @@ export interface TerminalReadModel {
   /** Fire-and-forget kill (dashboard/detail `x`). Not marked consumed: the
    * settle still flows back to the model as a follow-up message. */
   requestKill(id: string): void;
-  /**
-   * Register the settle hook. `consumed` is true when an active bg_kill is
-   * collecting the result (so it must not also be delivered as a follow-up).
-   */
+  /** Register the settle hook. `collecting` is advisory: an active kill is
+   * waiting for this result, but may still abort. Reserve delivery until that
+   * collector finishes; do not discard a result based on this flag alone. */
   setOnSettled(
-    hook: ((snap: TerminalSnapshot, consumed: boolean) => void) | undefined,
+    hook: ((snap: TerminalSnapshot, collecting: boolean) => void) | undefined,
   ): void;
 }
 
@@ -176,57 +175,6 @@ function shellInvocation(command: string) {
   return { shell: "/bin/sh", args: ["-c", command] };
 }
 
-/** Signal the whole process group on POSIX so descendants (servers a shell
- * command spawned) die with it; a wedged child must not orphan its tree. */
-function killTree(child: ChildProcess, signal: NodeJS.Signals) {
-  if (process.platform === "win32" && child.pid) {
-    try {
-      const killer = spawn(
-        "taskkill",
-        [
-          "/pid",
-          String(child.pid),
-          "/T",
-          ...(signal === "SIGKILL" ? ["/F"] : []),
-        ],
-        { stdio: "ignore", windowsHide: true },
-      );
-      killer.once("error", () => {
-        try {
-          child.kill(signal);
-        } catch {
-          // Process may already be gone.
-        }
-      });
-      killer.once("exit", (code) => {
-        if (code === 0) return;
-        try {
-          child.kill(signal);
-        } catch {
-          // Process may already be gone.
-        }
-      });
-      killer.unref();
-      return;
-    } catch {
-      // Fall through to the direct signal when taskkill cannot be launched.
-    }
-  }
-  if (process.platform !== "win32" && child.pid) {
-    try {
-      process.kill(-child.pid, signal);
-      return;
-    } catch {
-      // Group may already be gone; fall through to the direct signal.
-    }
-  }
-  try {
-    child.kill(signal);
-  } catch {
-    // Process may already be gone.
-  }
-}
-
 /** Await stdio closure without retaining a listener after interruption. */
 function awaitChildClose(child: ChildProcess, closed: () => boolean) {
   return Effect.callback<void>((resume) => {
@@ -240,32 +188,28 @@ function awaitChildClose(child: ChildProcess, closed: () => boolean) {
   });
 }
 
-/** SIGTERM → deadline → SIGKILL; waits for stdio closure rather than only the
- * shell's exit because descendants can keep the inherited pipes and process
- * group alive after the shell itself is gone. */
-function terminateChild(
-  child: ChildProcess,
-  closed: () => boolean,
-  onSignal: () => void,
-) {
-  return Effect.suspend(() => {
-    if (closed()) return Effect.void;
-    return Effect.gen(function* () {
-      yield* Effect.sync(() => {
-        onSignal();
-        killTree(child, "SIGTERM");
-      });
-      yield* awaitChildClose(child, closed).pipe(
-        Effect.timeout(FORCE_KILL_AFTER_MS),
-        Effect.ignore,
-      );
-      if (closed()) return;
-      yield* Effect.sync(() => killTree(child, "SIGKILL"));
-      yield* awaitChildClose(child, closed).pipe(
-        Effect.timeout(500),
-        Effect.ignore,
-      );
+/** Poll only during bounded teardown; closed pipes do not prove group death. */
+function awaitTreeExit(tree: ProcessTree) {
+  return Effect.gen(function* () {
+    while (tree.isAlive()) yield* Effect.sleep(25);
+  });
+}
+
+/** SIGTERM → deadline → SIGKILL, based on process-group rather than pipe liveness. */
+function terminateChild(tree: ProcessTree, onSignal: () => void) {
+  return Effect.gen(function* () {
+    if (!tree.isAlive()) return;
+    yield* Effect.sync(() => {
+      onSignal();
+      tree.signal("SIGTERM");
     });
+    yield* awaitTreeExit(tree).pipe(
+      Effect.timeout(FORCE_KILL_AFTER_MS),
+      Effect.ignore,
+    );
+    if (!tree.isAlive()) return;
+    yield* Effect.sync(() => tree.signal("SIGKILL"));
+    yield* awaitTreeExit(tree).pipe(Effect.timeout(500), Effect.ignore);
   });
 }
 
@@ -285,7 +229,7 @@ const makeManager = Effect.gen(function* () {
     string,
     Pick<KillResult, "title" | "status" | "exit">
   >();
-  /** ids with an in-flight kill() collecting the result (settle → consumed). */
+  /** ids with an in-flight kill() collecting the result (also protects pruning). */
   const killInterest = new Map<string, number>();
   const listeners = new Set<() => void>();
   const idListeners = new Map<string, Set<() => void>>();
@@ -294,7 +238,7 @@ const makeManager = Effect.gen(function* () {
   let disposed = false;
   let spillDir: string | undefined | null;
   let onSettled:
-    ((snap: TerminalSnapshot, consumed: boolean) => void) | undefined;
+    ((snap: TerminalSnapshot, collecting: boolean) => void) | undefined;
 
   const notify = (id?: string) => {
     for (const listener of [...listeners]) {
@@ -361,12 +305,23 @@ const makeManager = Effect.gen(function* () {
       (stream) =>
         Effect.callback<void>((resume) => {
           const done = () => resume(Effect.void);
+          if (stream.destroyed || stream.writableFinished) {
+            done();
+            return;
+          }
+          stream.once("finish", done);
+          stream.once("close", done);
+          stream.once("error", done);
           try {
-            stream.end(done);
+            stream.end();
           } catch {
-            // Best effort; tmpdir contents are disposable.
             done();
           }
+          return Effect.sync(() => {
+            stream.off("finish", done);
+            stream.off("close", done);
+            stream.off("error", done);
+          });
         }),
       { concurrency: "unbounded", discard: true },
     ).pipe(
@@ -380,6 +335,11 @@ const makeManager = Effect.gen(function* () {
               "Full-log spill flush timed out; full output may be incomplete";
           }),
       }),
+      Effect.ensuring(
+        Effect.sync(() => {
+          for (const stream of streams) stream.destroy();
+        }),
+      ),
     );
   };
 
@@ -407,46 +367,33 @@ const makeManager = Effect.gen(function* () {
       settledHistory.delete(oldest);
     }
     // Completing the Deferred can immediately resume kill waiters, whose
-    // ensuring blocks release interest. Snapshot consumption first so the
-    // settle hook observes the interest that existed when settlement won.
-    const consumed = (killInterest.get(s.id) ?? 0) > 0;
+    // ensuring blocks release interest. Snapshot the advisory collection flag
+    // first; actual delivery acknowledgement belongs to the tool boundary.
+    const collecting = (killInterest.get(s.id) ?? 0) > 0;
     Deferred.doneUnsafe(entry.settled, Effect.void);
     notify(s.id);
     try {
       // During teardown, don't queue results into a shutting-down session.
-      if (!disposed) onSettled?.(s, consumed);
+      if (!disposed) onSettled?.(s, collecting);
     } catch {
       // The parent session may be unavailable; settlement stays final.
     }
     pruneSettled();
   };
 
-  /** Flush the spill files, then settle: the completion follow-up (and the
-   * kill() resolution) reference the spill path, so the full capture must be
-   * on disk before anyone is told about it. Idempotent via `settling`. */
-  const settleAfterFlush = (entry: Entry) => {
-    if (entry.settling || entry.snapshot.status !== "running") return;
-    entry.settling = true;
-    runCleanup(
-      flushSpillStreams(entry).pipe(
-        Effect.andThen(Effect.sync(() => settle(entry))),
-      ),
-    );
-  };
-
+  /** Every exit closes the entry scope, even if redirected descendants closed
+   * all our pipes. Settlement happens only after that scope's cleanup/flush. */
   const scheduleExitCleanup = (entry: Entry) => {
     if (entry.exitCleanupStarted) return;
     entry.exitCleanupStarted = true;
     runCleanup(
-      Effect.sleep(SETTLE_GRACE_MS).pipe(
+      awaitChildClose(entry.child, () => entry.stdioClosed).pipe(
+        Effect.timeout(SETTLE_GRACE_MS),
+        Effect.ignore,
         Effect.andThen(
-          Effect.suspend(() =>
-            entry.snapshot.status === "running" && !entry.stdioClosed
-              ? closeEntryScope(entry).pipe(
-                  Effect.timeout(STOP_TIMEOUT_MS),
-                  Effect.ignore,
-                )
-              : Effect.void,
+          closeEntryScope(entry).pipe(
+            Effect.timeout(STOP_TIMEOUT_MS),
+            Effect.ignore,
           ),
         ),
       ),
@@ -616,7 +563,6 @@ const makeManager = Effect.gen(function* () {
           processErrored: false,
           exited: false,
           stdioClosed: false,
-          settling: false,
           exitCleanupStarted: false,
           settled,
         };
@@ -624,27 +570,41 @@ const makeManager = Effect.gen(function* () {
         // Plain-callback stream plumbing (the codex-backend precedent):
         // setEncoding's internal StringDecoder is multibyte-safe across
         // chunk boundaries.
-        child.stdout?.setEncoding("utf8");
-        child.stdout?.on("data", (chunk: string) => {
+        let captureClosed = false;
+        const onStdout = (chunk: string) => {
+          if (captureClosed) return;
           if (!stdoutBuf.push(chunk)) child.stdout?.pause();
           notify(id);
-        });
-        child.stderr?.setEncoding("utf8");
-        child.stderr?.on("data", (chunk: string) => {
+        };
+        const onStderr = (chunk: string) => {
+          if (captureClosed) return;
           if (!stderrBuf.push(chunk)) child.stderr?.pause();
           notify(id);
-        });
+        };
+        const stopCapture = () => {
+          if (captureClosed) return;
+          captureClosed = true;
+          child.stdout?.off("data", onStdout);
+          child.stderr?.off("data", onStderr);
+          child.stdout?.destroy();
+          child.stderr?.destroy();
+        };
+        const tree = createProcessTree(child, () => entry.exited);
+        child.stdout?.setEncoding("utf8");
+        child.stdout?.on("data", onStdout);
+        child.stderr?.setEncoding("utf8");
+        child.stderr?.on("data", onStderr);
         // Spawn failures (ENOENT etc.) arrive via 'error', not a throw. Node
         // still emits 'close' afterwards (with a bogus errno as code), so
-        // record the failure here and let the close path do the one settle.
+        // record the failure here and queue bounded scope cleanup/settlement.
         child.once("error", (error) => {
           entry.processErrored = true;
           snapshot.errorText ??= boundedError(error);
           entry.exited = true;
-          settleAfterFlush(entry);
+          scheduleExitCleanup(entry);
         });
-        // Record code/signal on 'exit'; settle on 'close' so the completion
-        // notification always carries the final flushed output.
+        // Record code/signal on 'exit'; the scope finalizer settles only after
+        // group cleanup and capture/spill drainage have finished.
         child.once("exit", (code, signal) => {
           entry.exited = true;
           snapshot.exitCode = code ?? undefined;
@@ -663,7 +623,7 @@ const makeManager = Effect.gen(function* () {
             snapshot.exitCode ??= code ?? undefined;
             snapshot.signal ??= signal ?? undefined;
           }
-          settleAfterFlush(entry);
+          scheduleExitCleanup(entry);
         });
 
         // One teardown path: kill(), requestKill, pruning, disposeAll, and
@@ -674,38 +634,30 @@ const makeManager = Effect.gen(function* () {
               // Only claim "killed" when we are actually about to signal a
               // live process; a natural exit that already happened (still
               // waiting on 'close') keeps its truthful done/failed status.
-              yield* terminateChild(
-                child,
-                () => entry.stdioClosed,
-                () => {
-                  entry.killSignaled ||=
-                    !entry.exited && entry.snapshot.status === "running";
-                },
+              yield* terminateChild(tree, () => {
+                entry.killSignaled ||=
+                  !entry.exited && entry.snapshot.status === "running";
+              });
+              if (tree.isAlive()) {
+                entry.snapshot.errorText ??=
+                  "Process tree still exists after termination deadline; cleanup may be incomplete";
+              }
+              // An escaped process group can keep inherited pipes open. Bound
+              // drainage separately, then close OUR handles even if it survives.
+              yield* awaitChildClose(child, () => entry.stdioClosed).pipe(
+                Effect.timeoutOrElse({
+                  duration: SETTLE_GRACE_MS,
+                  orElse: () =>
+                    Effect.sync(() => {
+                      entry.snapshot.errorText ??=
+                        "stdio did not close after termination; output may be incomplete";
+                    }),
+                }),
               );
-              // Give the natural close→flush→settle path a bounded grace,
-              // then force the settle: a grandchild holding the pipe open
-              // (detached into a new group) must not leave the entry
-              // "running" forever.
-              if (entry.snapshot.status === "running") {
-                yield* Deferred.await(entry.settled).pipe(
-                  Effect.timeout(SETTLE_GRACE_MS),
-                  Effect.ignore,
-                );
-              }
-              if (entry.snapshot.status === "running" && !entry.settling) {
-                // Force the settle ourselves. When `settling` is set, the
-                // close path's flush→settle is already in flight (bounded by
-                // SPILL_FLUSH_TIMEOUT_MS) — settling here first would cite a
-                // spill file that is still being flushed.
-                if (!entry.stdioClosed) {
-                  entry.snapshot.errorText ??=
-                    "stdio did not close after termination; output may be incomplete";
-                }
-                entry.settling = true;
-                yield* flushSpillStreams(entry);
-                settle(entry);
-              }
-            }),
+              yield* Effect.sync(stopCapture);
+              yield* flushSpillStreams(entry);
+              yield* Effect.sync(() => settle(entry));
+            }).pipe(Effect.ensuring(Effect.sync(stopCapture))),
           ),
           scope,
         );
@@ -781,8 +733,8 @@ const makeManager = Effect.gen(function* () {
         (entry) => entry.snapshot.status === "running",
       );
       const runningIds = running.map((entry) => entry.snapshot.id);
-      // Mark consumed before signaling so this kill's settlements are not
-      // ALSO queued as automatic follow-up messages to the model.
+      // Protect these entries from pruning while this collector waits. This
+      // is provisional interest, not acknowledgement of a tool response.
       addKillInterest(runningIds);
       const work = Effect.gen(function* () {
         yield* Effect.forEach(running, killEntry, {
@@ -814,6 +766,13 @@ const makeManager = Effect.gen(function* () {
             exit: snapshot
               ? formatExit(snapshot)
               : (history?.exit ?? "unknown"),
+            snapshot: snapshot
+              ? {
+                  ...snapshot,
+                  stdout: { ...snapshot.stdout },
+                  stderr: { ...snapshot.stderr },
+                }
+              : undefined,
           };
         });
       });

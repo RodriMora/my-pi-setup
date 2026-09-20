@@ -10,6 +10,7 @@ import {
   hyperlink,
   truncateToWidth,
   visibleWidth,
+  type Component,
 } from "@earendil-works/pi-tui";
 import {
   emptyGitInfoState,
@@ -21,15 +22,10 @@ import {
   isModelInfoState,
 } from "../shared/dashboard-state.ts";
 import { createFullscreenScrollOverride } from "./src/fullscreen-scroll.ts";
+import { hideLoadedThemes } from "./src/theme-section.ts";
 
 type Rgb = [number, number, number];
-interface RenderableNode {
-  children?: RenderableNode[];
-  invalidate(): void;
-  render(width: number): string[];
-}
-
-interface DashboardTui extends RenderableNode {
+interface DashboardTui {
   requestRender(force?: boolean): void;
 }
 
@@ -51,8 +47,6 @@ const TITLE_LINES = [
   "  ██║      ██║ ",
   "  ╚═╝      ╚═╝ ",
 ];
-const ANSI_PATTERN =
-  /[\u001B\u009B][[\]()#;?]*(?:(?:(?:[a-zA-Z\d]*(?:;[a-zA-Z\d]*)*)?\u0007)|(?:(?:\d{1,4}(?:;\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]))/g;
 // eslint-disable-next-line no-control-regex
 const OSC_PATTERN =
   /(?:\u001b\]|\u009d)(?:[^\u0007\u001b\u009c]|\u001b(?!\\))*(?:\u0007|\u001b\\|\u009c)/g;
@@ -106,47 +100,6 @@ function gradientText(text: string, phase: number) {
     .join("");
 }
 
-function hasChildren(
-  component: RenderableNode,
-): component is RenderableNode & { children: RenderableNode[] } {
-  return Array.isArray(component.children);
-}
-
-function renderedText(component: RenderableNode) {
-  try {
-    return component.render(200).join("\n").replace(ANSI_PATTERN, "");
-  } catch {
-    return "";
-  }
-}
-
-function hideThemesSection(component: RenderableNode) {
-  if (!hasChildren(component)) return false;
-
-  for (let index = 0; index < component.children.length; index += 1) {
-    const child = component.children[index]!;
-    const firstLine = renderedText(child)
-      .split("\n")
-      .find((line) => line.trim())
-      ?.trim();
-
-    if (firstLine === "[Themes]") {
-      const removeCount =
-        component.children[index + 1] &&
-        renderedText(component.children[index + 1]!).trim() === ""
-          ? 2
-          : 1;
-      component.children.splice(index, removeCount);
-      component.invalidate();
-      return true;
-    }
-
-    if (hideThemesSection(child)) return true;
-  }
-
-  return false;
-}
-
 function formatTokens(tokens: number) {
   if (tokens < 1_000) return `${tokens}`;
   if (tokens < 1_000_000) return `${Math.round(tokens / 1_000)}k`;
@@ -192,44 +145,61 @@ export default function uiCustomization(pi: ExtensionAPI) {
   let gitInfo = emptyGitInfoState();
   let requestRender: (() => void) | undefined;
   let activeTui: DashboardTui | undefined;
-  let themeRemovalTimers: Array<ReturnType<typeof setTimeout>> = [];
+  let activeHeader: Component | undefined;
+  let activeFooter: Component | undefined;
+  const themeRemovalTimers = new Set<ReturnType<typeof setTimeout>>();
+  let removalGeneration = 0;
+  let disposed = false;
 
   const stopModelListener = pi.events.on(MODEL_INFO_CHANNEL, (value) => {
-    if (!isModelInfoState(value)) return;
+    if (disposed || !isModelInfoState(value)) return;
     modelInfo = value;
     requestRender?.();
   });
 
   const stopGitListener = pi.events.on(GIT_INFO_CHANNEL, (value) => {
-    if (!isGitInfoState(value)) return;
+    if (disposed || !isGitInfoState(value)) return;
     gitInfo = value;
     requestRender?.();
   });
 
-  function scheduleThemeRemoval(tui: DashboardTui) {
+  function cancelThemeRemoval() {
+    removalGeneration += 1;
     for (const timer of themeRemovalTimers) clearTimeout(timer);
-    themeRemovalTimers = [];
+    themeRemovalTimers.clear();
+  }
 
+  function scheduleThemeRemoval(tui: DashboardTui, header: Component) {
+    cancelThemeRemoval();
+    if (disposed) return;
+    const generation = removalGeneration;
     for (const delay of [0, 50, 250, 1_000]) {
-      themeRemovalTimers.push(
-        setTimeout(() => {
-          if (hideThemesSection(tui)) tui.requestRender(true);
-        }, delay),
-      );
+      const timer = setTimeout(() => {
+        themeRemovalTimers.delete(timer);
+        if (disposed || generation !== removalGeneration || activeHeader !== header) return;
+        if (hideLoadedThemes(tui, header)) {
+          if (disposed || generation !== removalGeneration) return;
+          cancelThemeRemoval();
+          tui.requestRender(true);
+        }
+      }, delay);
+      themeRemovalTimers.add(timer);
     }
   }
 
   function install(ctx: ExtensionContext) {
-    if (ctx.mode !== "tui") return;
+    if (disposed || ctx.mode !== "tui") return;
+    const cwd = ctx.cwd;
 
     ctx.ui.setHeader((tui) => {
+      if (disposed) return { render: () => [], invalidate() {} };
       activeTui = tui;
       fullscreenScroll.apply(tui);
       requestRender = () => tui.requestRender();
-      scheduleThemeRemoval(tui);
 
-      return {
+      const header = {
         render(width: number) {
+          if (disposed || activeHeader !== header) return [];
           const art = TITLE_LINES.map((line, row) =>
             center(gradientText(line, row * 0.045), width),
           );
@@ -240,18 +210,34 @@ export default function uiCustomization(pi: ExtensionAPI) {
           return ["", ...art, subtitle, ""];
         },
         invalidate() {},
+        dispose() {
+          if (activeHeader !== header) return;
+          activeHeader = undefined;
+          cancelThemeRemoval();
+        },
       };
+      activeHeader = header;
+      scheduleThemeRemoval(tui, header);
+      return header;
     });
 
     ctx.ui.setFooter((tui, theme, footerData: ReadonlyFooterDataProvider) => {
-      requestRender = () => tui.requestRender();
+      if (disposed) return { render: () => [], invalidate() {} };
+      const refresh = () => tui.requestRender();
+      requestRender = refresh;
 
-      return {
+      const footer = {
         invalidate() {},
+        dispose() {
+          if (activeFooter !== footer) return;
+          activeFooter = undefined;
+          if (requestRender === refresh) requestRender = undefined;
+        },
         render(width: number) {
+          if (disposed || activeFooter !== footer) return [];
           // Reapply when /settings replaces the renderer on a TUI mode switch.
           fullscreenScroll.apply(tui);
-          const directory = theme.fg("text", formatDirectory(ctx.cwd));
+          const directory = theme.fg("text", formatDirectory(cwd));
           const fileLabel = gitInfo.changedFiles === 1 ? "file" : "files";
           let git = gitInfo.branch
             ? `${gitInfo.branch} · ${gitInfo.changedFiles} ${fileLabel} changed`
@@ -304,6 +290,8 @@ export default function uiCustomization(pi: ExtensionAPI) {
           return lines;
         },
       };
+      activeFooter = footer;
+      return footer;
     });
 
     ctx.ui.setTitle(`pi · ${title}`);
@@ -311,6 +299,7 @@ export default function uiCustomization(pi: ExtensionAPI) {
   }
 
   pi.on("session_start", (_event, ctx) => {
+    if (disposed) return;
     title = formatDirectory(ctx.cwd);
     modelInfo = emptyModelInfoState();
     gitInfo = emptyGitInfoState();
@@ -318,20 +307,23 @@ export default function uiCustomization(pi: ExtensionAPI) {
   });
 
   pi.on("resources_discover", () => {
-    if (activeTui) scheduleThemeRemoval(activeTui);
+    if (!disposed && activeTui && activeHeader) scheduleThemeRemoval(activeTui, activeHeader);
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
+    if (disposed) return;
+    disposed = true;
+    cancelThemeRemoval();
     fullscreenScroll.dispose(activeTui);
     stopModelListener();
     stopGitListener();
-    for (const timer of themeRemovalTimers) clearTimeout(timer);
-    themeRemovalTimers = [];
     activeTui = undefined;
     requestRender = undefined;
     if (ctx.mode === "tui") {
-      ctx.ui.setHeader(undefined);
-      ctx.ui.setFooter(undefined);
+      if (activeHeader) ctx.ui.setHeader(undefined);
+      if (activeFooter) ctx.ui.setFooter(undefined);
     }
+    activeHeader = undefined;
+    activeFooter = undefined;
   });
 }

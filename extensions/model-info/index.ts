@@ -1,5 +1,5 @@
 import { appendFileSync } from "node:fs";
-import { uuidv7 } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels, hasApi, uuidv7 } from "@earendil-works/pi-ai";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type {
   ExtensionAPI,
@@ -11,20 +11,27 @@ import {
   REFRESH_CHANNEL,
 } from "../shared/dashboard-state.ts";
 
+import { abortable, abortableDelay } from "./src/abortable.ts";
+import {
+  getSessionCost, titleRecord, titleRequestHash, usageCost, TITLE_ENTRY_TYPE,
+  TITLE_REQUEST_CHAR_LIMIT as FIRST_MESSAGE_CHAR_LIMIT,
+  TITLE_CHAR_LIMIT as SUMMARY_CHAR_LIMIT, type TitleRecord,
+} from "./src/session-cost.ts";
+
+const SUMMARY_DEADLINE_MS = 30_000;
 const CHARS_PER_ESTIMATED_TOKEN = 4;
 const LIVE_UPDATE_INTERVAL_MS = 200;
-const FIRST_MESSAGE_CHAR_LIMIT = 8_000;
 const ASSISTANT_CONTEXT_CHAR_LIMIT = 4_000;
-const SUMMARY_CHAR_LIMIT = 39;
 const SUMMARY_MAX_TOKENS = 2048;
 const SUMMARY_LOG = "/tmp/pi-summary.log";
-// Deferred fallback kick for turns where no assistant delta was observed
-// (see turn_start). Long enough that the main request is already on the wire.
+// Deferred fallback for turns with no observed assistant delta. This gives
+// the main request a head start, not a guarantee of server-side ordering.
 const SUMMARY_FALLBACK_KICK_MS = 1_000;
 
-function logSummaryError(message: string) {
+function logSummaryError(message: string, error?: unknown) {
   try {
-    appendFileSync(SUMMARY_LOG, `${new Date().toISOString()} ${message}\n`);
+    const detail = error === undefined ? "" : `: ${error instanceof Error ? error.message : String(error)}`;
+    appendFileSync(SUMMARY_LOG, `${new Date().toISOString()} ${message}${detail}\n`);
   } catch {
     // Logging must never break the extension.
   }
@@ -77,7 +84,8 @@ function extractText(content: unknown): string | null {
 function getFirstUserMessage(ctx: ExtensionContext): string | null {
   for (const entry of ctx.sessionManager.getBranch()) {
     if (entry.type === "message" && entry.message.role === "user") {
-      return extractText(entry.message.content);
+      const text = extractText(entry.message.content);
+      if (text) return text;
     }
   }
   return null;
@@ -95,10 +103,6 @@ function getLastAssistantText(ctx: ExtensionContext): string | null {
   return null;
 }
 
-function isGptModel(model: Model<Api> | undefined): boolean {
-  return model !== undefined && /gpt-5\./.test(model.id);
-}
-
 function cleanSummary(text: string): string | null {
   const cleaned = text
     .replace(CONTROL_CHARS, " ")
@@ -113,18 +117,6 @@ function cleanSummary(text: string): string | null {
   const prefix = cleaned.slice(0, SUMMARY_CHAR_LIMIT - 1);
   const wordEnd = prefix.lastIndexOf(" ");
   return `${wordEnd > 0 ? prefix.slice(0, wordEnd) : prefix}…`;
-}
-
-function getSessionCost(ctx: ExtensionContext) {
-  let cost = 0;
-
-  for (const entry of ctx.sessionManager.getBranch()) {
-    if (entry.type === "message" && entry.message.role === "assistant") {
-      cost += entry.message.usage.cost.total;
-    }
-  }
-
-  return cost;
 }
 
 function estimateContentTokens(characters: number) {
@@ -147,21 +139,66 @@ export default function modelInfo(pi: ExtensionAPI) {
   let summaryRequested = false;
   let summaryAbort: AbortController | null = null;
 
-  const publish = () => pi.events.emit(MODEL_INFO_CHANNEL, { ...state });
+  let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
+  let generation = 0;
+  let disposed = false;
+  const unpersistedCosts = new Map<string, number>();
 
-  /**
-   * Pick which model produces the session summary, based on the active model:
-   * - any gpt-5.x model        -> the active model with low reasoning
-   * - babel-litellm/Babel-LLM  -> the active model itself
-   * - local-dgx/*              -> the active model itself
-   */
+  const publish = () => {
+    if (!disposed) pi.events.emit(MODEL_INFO_CHANNEL, { ...state });
+  };
+
+  function cancelFallback() {
+    if (fallbackTimer !== undefined) clearTimeout(fallbackTimer);
+    fallbackTimer = undefined;
+  }
+
+  function cancelSummary() {
+    generation += 1;
+    cancelFallback();
+    summaryAbort?.abort();
+    summaryAbort = null;
+  }
+
+  function sessionCost(ctx: ExtensionContext) {
+    const entries = ctx.sessionManager.getEntries();
+    for (const entry of entries) {
+      const id = titleRecord(entry)?.attemptId;
+      if (id) unpersistedCosts.delete(id);
+    }
+    let cost = getSessionCost(entries);
+    for (const value of unpersistedCosts.values()) {
+      if (Number.isFinite(cost + value)) cost += value;
+    }
+    return cost;
+  }
+
+  function restoreSummary(ctx: ExtensionContext) {
+    let summary: string | null = null;
+    if (firstMessageText !== null) {
+      const hash = titleRequestHash(firstMessageText);
+      for (const entry of ctx.sessionManager.getEntries()) {
+        const record = titleRecord(entry);
+        if (record?.requestHash === hash && record.summary) {
+          summary = cleanSummary(record.summary) ?? summary;
+        }
+      }
+    }
+    summaryRequested = summary !== null;
+    state = { ...state, summary, summarizing: false };
+  }
+
+  // complete() accepts API-specific options, not completeSimple()'s reasoning.
+  // Keep the active provider/auth; only compatible APIs receive reasoningEffort.
   function resolveSummaryModel(
     ctx: ExtensionContext,
   ): { model: Model<Api>; reasoningEffort?: "low" } | undefined {
     const main = ctx.model;
     if (!main) return undefined;
 
-    if (isGptModel(main)) {
+    if (getSupportedThinkingLevels(main).includes("low") &&
+        (hasApi(main, "openai-responses") || hasApi(main, "openai-codex-responses") ||
+         hasApi(main, "azure-openai-responses") || hasApi(main, "openai-completions"))) {
       // Keep summaries on the active model's provider and credentials.
       if (ctx.modelRegistry.hasConfiguredAuth(main)) {
         return { model: main, reasoningEffort: "low" };
@@ -169,7 +206,7 @@ export default function modelInfo(pi: ExtensionAPI) {
       return undefined;
     }
 
-    // babel-litellm / local-dgx (and any other non-gpt active model): use itself.
+    // Other APIs retain their own defaults rather than receiving foreign options.
     return ctx.modelRegistry.hasConfiguredAuth(main)
       ? { model: main }
       : undefined;
@@ -222,84 +259,81 @@ export default function modelInfo(pi: ExtensionAPI) {
 
   async function generateSummary(ctx: ExtensionContext) {
     const controller = new AbortController();
+    const requestGeneration = generation;
     summaryAbort = controller;
-    state = { ...state, summarizing: true };
-    publish();
+    const ownsRequest = () => !disposed && generation === requestGeneration && summaryAbort === controller;
+    const isActive = () => ownsRequest() && !controller.signal.aborted;
+    const deadline = setTimeout(() => controller.abort(new Error("Session title deadline exceeded")), SUMMARY_DEADLINE_MS);
+    deadline.unref?.();
+    let turnSignal: AbortSignal | undefined;
+    const abortWithTurn = () => controller.abort(turnSignal?.reason);
 
     try {
+      state = { ...state, summarizing: true };
+      publish();
+      if (!isActive()) return;
+      turnSignal = ctx.signal;
+      if (turnSignal?.aborted) { abortWithTurn(); return; }
+      turnSignal?.addEventListener("abort", abortWithTurn, { once: true });
       const target = resolveSummaryModel(ctx);
-      if (!target) {
-        logSummaryError(`no summary model for ${ctx.model?.provider}/${ctx.model?.id}`);
-        state = { ...state, summarizing: false };
-        return;
-      }
-
+      if (!target) return;
       const lastAssistantText = getLastAssistantText(ctx);
       const firstMessage = firstMessageText!;
+      const requestHash = titleRequestHash(firstMessage);
 
-      // Reasoning models can burn the token budget on thinking and return
-      // stopReason=length with empty text; providers can also hiccup. Retry
-      // with T3-Code-style exponential backoff (2 attempts more, 2s base).
-      let text = "";
+      // Empty responses get two retries, within one overall deadline.
       for (let attempt = 0; attempt < 3; attempt += 1) {
-        if (attempt > 0) {
-          const delayMs = 2 ** attempt * 1000;
-          await new Promise<void>((resolve) => {
-            const timer = setTimeout(resolve, delayMs);
-            controller.signal.addEventListener(
-              "abort",
-              () => {
-                clearTimeout(timer);
-                resolve();
-              },
-              { once: true },
-            );
-          });
-          if (controller.signal.aborted) return;
-        }
-        const response = await completeSummary(
-          ctx,
-          target,
-          firstMessage,
-          lastAssistantText,
-          controller.signal,
-        );
-        text = response.content
+        if (attempt > 0) await abortableDelay(2 ** attempt * 1000, controller.signal);
+        if (!isActive()) return;
+        const response = await abortable(completeSummary(
+          ctx, target, firstMessage, lastAssistantText, controller.signal,
+        ), controller.signal);
+        if (!isActive()) return;
+        const text = response.content
           .filter((c): c is { type: "text"; text: string } => c.type === "text")
-          .map((c) => c.text)
-          .join(" ");
-        if (text.trim()) break;
-        logSummaryError(
-          `empty summary response (attempt ${attempt + 1}, stopReason=${(response as { stopReason?: string }).stopReason ?? "unknown"}, errorMessage=${(response as { errorMessage?: string }).errorMessage ?? "n/a"}, model=${target.model.provider}/${target.model.id})`,
-        );
+          .map(c => c.text).join(" ");
+        const summary = response.stopReason === "error" || response.stopReason === "aborted"
+          ? null : cleanSummary(text);
+        const record: TitleRecord = {
+          version: 1, requestHash, summary, cost: usageCost(response.usage), attemptId: uuidv7(),
+        };
+        // Reconcile by attempt ID even if appendEntry committed before throwing.
+        unpersistedCosts.set(record.attemptId!, record.cost);
+        try { pi.appendEntry(TITLE_ENTRY_TYPE, record); }
+        catch (error) { logSummaryError("title persistence failed", error); }
+        if (!isActive()) return;
+        state = { ...state, summary, cost: sessionCost(ctx) };
+        if (summary) break;
+        logSummaryError("empty/failed title response", response.errorMessage ?? response.stopReason);
+        publish();
       }
-      state = {
-        ...state,
-        summarizing: false,
-        summary: cleanSummary(text),
-      };
     } catch (error) {
-      // Failures (including aborts) are non-fatal: the footer just shows no summary.
-      if (!controller.signal.aborted) {
-        logSummaryError(
-          `summary request failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
-        state = { ...state, summarizing: false, summary: null };
+      if (isActive()) {
+        logSummaryError("summary request failed", error);
       }
     } finally {
-      if (summaryAbort === controller) summaryAbort = null;
-      if (!controller.signal.aborted) publish();
+      clearTimeout(deadline);
+      turnSignal?.removeEventListener("abort", abortWithTurn);
+      if (ownsRequest()) {
+        summaryAbort = null;
+        state = { ...state, summarizing: false };
+        publish();
+      }
     }
   }
 
   function requestSummary(ctx: ExtensionContext) {
-    if (summaryRequested) return;
+    if (disposed || summaryRequested || firstMessageText === null || ctx.mode !== "tui") return;
+    cancelFallback();
     summaryRequested = true;
-    // Fire-and-forget: never block the main turn on summary generation.
-    void generateSummary(ctx);
+    // Observe all failures, including event-bus publication failures.
+    void generateSummary(ctx).catch(error => {
+      if (!disposed) logSummaryError("summary task failed", error);
+    });
   }
 
   function refresh(ctx: ExtensionContext) {
+    if (disposed) return;
     currentContext = ctx;
     const model = ctx.model;
     const usage = ctx.getContextUsage();
@@ -313,7 +347,7 @@ export default function modelInfo(pi: ExtensionAPI) {
       contextTokens: usage?.tokens ?? null,
       contextWindow: usage?.contextWindow ?? model?.contextWindow ?? 0,
       contextPercent: usage?.percent ?? null,
-      cost: getSessionCost(ctx),
+      cost: sessionCost(ctx),
     };
     publish();
   }
@@ -329,16 +363,16 @@ export default function modelInfo(pi: ExtensionAPI) {
   }
 
   const stopRefreshListener = pi.events.on(REFRESH_CHANNEL, () => {
-    if (currentContext) refresh(currentContext);
+    if (!disposed && currentContext) refresh(currentContext);
   });
 
   pi.on("session_start", (_event, ctx) => {
+    if (disposed) return;
+    cancelSummary();
     resetMessageTracking();
     runContentTokens = 0;
     runContentStreamMs = 0;
-    summaryAbort?.abort();
-    summaryAbort = null;
-    summaryRequested = false;
+    unpersistedCosts.clear();
     firstMessageText = getFirstUserMessage(ctx);
     state = {
       ...state,
@@ -347,10 +381,12 @@ export default function modelInfo(pi: ExtensionAPI) {
       summary: null,
       summarizing: false,
     };
+    restoreSummary(ctx);
     refresh(ctx);
   });
 
   pi.on("model_select", (event, ctx) => {
+    if (disposed) return;
     state = {
       ...state,
       provider: event.model.provider,
@@ -363,11 +399,13 @@ export default function modelInfo(pi: ExtensionAPI) {
   });
 
   pi.on("thinking_level_select", (event) => {
+    if (disposed) return;
     state = { ...state, thinking: event.level };
     publish();
   });
 
   pi.on("agent_start", (_event, ctx) => {
+    if (disposed) return;
     runContentTokens = 0;
     runContentStreamMs = 0;
     resetMessageTracking();
@@ -376,9 +414,11 @@ export default function modelInfo(pi: ExtensionAPI) {
   });
 
   pi.on("message_start", (event, ctx) => {
+    if (disposed) return;
     if (event.message.role === "assistant") resetMessageTracking();
     if (event.message.role === "user" && firstMessageText === null) {
       firstMessageText = extractText(event.message.content);
+      restoreSummary(ctx);
       // Deliberately NOT requesting the summary here. At user message_start
       // the main agent request has not been sent yet; firing the summary now
       // would let it reach a concurrency-limited server (e.g. local-dgx)
@@ -390,7 +430,7 @@ export default function modelInfo(pi: ExtensionAPI) {
   });
 
   pi.on("message_update", (event, ctx) => {
-    if (event.message.role !== "assistant") return;
+    if (disposed || event.message.role !== "assistant") return;
 
     const streamEvent = event.assistantMessageEvent;
     if (streamEvent.type === "toolcall_delta") {
@@ -439,7 +479,11 @@ export default function modelInfo(pi: ExtensionAPI) {
   });
 
   pi.on("message_end", (event, ctx) => {
-    if (event.message.role !== "assistant") return;
+    if (disposed) return;
+    if (event.message.role !== "assistant") {
+      if (event.message.role === "toolResult") refresh(ctx);
+      return;
+    }
 
     sawToolCall ||= event.message.content.some(
       (block) => block.type === "toolCall",
@@ -481,27 +525,44 @@ export default function modelInfo(pi: ExtensionAPI) {
   pi.on("turn_end", (_event, ctx) => refresh(ctx));
 
   pi.on("turn_start", (_event, ctx) => {
-    // Fallback for flows where no assistant delta triggers the summary (e.g.
-    // queued/injected messages). Deferred so the main request — which starts
-    // right after this event — still reaches the server first. No-op once a
-    // summary was requested.
-    if (firstMessageText === null || summaryRequested) return;
-    const kickTimer = setTimeout(() => requestSummary(ctx), SUMMARY_FALLBACK_KICK_MS);
-    kickTimer.unref?.();
+    if (disposed || ctx.mode !== "tui" || firstMessageText === null || summaryRequested || fallbackTimer !== undefined) return;
+    // This delay cannot prove the main request reached the server. Observed
+    // assistant deltas remain the primary trigger; the timer is a fallback.
+    const scheduledGeneration = generation;
+    const timer = setTimeout(() => {
+      if (disposed || scheduledGeneration !== generation || fallbackTimer !== timer) return;
+      fallbackTimer = undefined;
+      requestSummary(ctx);
+    }, SUMMARY_FALLBACK_KICK_MS);
+    fallbackTimer = timer;
+    timer.unref?.();
   });
 
   pi.on("agent_settled", (_event, ctx) => {
+    if (disposed) return;
     state = { ...state, generating: false };
     refresh(ctx);
-    // Last-resort trigger: normally the summary was already kicked off when
-    // the first user message arrived (see message_start / turn_start).
+    // Last-resort trigger if neither a delta nor the fallback started it.
     if (firstMessageText !== null) requestSummary(ctx);
   });
 
+  pi.on("session_compact", (_event, ctx) => refresh(ctx));
+  pi.on("session_tree", (_event, ctx) => {
+    if (disposed) return;
+    const first = getFirstUserMessage(ctx);
+    if (first !== firstMessageText) {
+      cancelSummary();
+      firstMessageText = first;
+      restoreSummary(ctx);
+    }
+    refresh(ctx);
+  });
+
   pi.on("session_shutdown", () => {
+    if (disposed) return;
+    disposed = true;
+    cancelSummary();
     stopRefreshListener();
-    summaryAbort?.abort();
-    summaryAbort = null;
     currentContext = undefined;
   });
 }

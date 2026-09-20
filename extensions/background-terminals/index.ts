@@ -26,7 +26,7 @@ import type {
   ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
-import { Markdown, Text } from "@earendil-works/pi-tui";
+import { Markdown, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import type { TerminalSnapshot } from "./src/domain.ts";
 import { TerminalManager, type TerminalManagerShape } from "./src/manager.ts";
@@ -60,18 +60,23 @@ const WIDGET_KEY = "background-terminals";
 export default function (pi: ExtensionAPI) {
   let runtime: TerminalRuntime | undefined;
   let managerPromise: Promise<TerminalManagerShape> | undefined;
+  let disposed = false;
   let sessionContext: ExtensionContext | undefined;
   let ui: ExtensionUIContext | undefined;
   let unsubStatus: (() => void) | undefined;
   const resultDelivery = createDeferredResultDelivery<TerminalSnapshot>();
 
-  const getRuntime = () => (runtime ??= createTerminalRuntime());
+  const getRuntime = () => {
+    if (disposed) throw new Error("Background terminal extension is shutting down.");
+    return (runtime ??= createTerminalRuntime());
+  };
 
   /** Resolve the manager service once per runtime and wire the extension hooks. */
   const getManager = () => {
     managerPromise ??= getRuntime()
       .runPromise(TerminalManager)
       .then((manager) => {
+        if (disposed) throw new Error("Background terminal extension is shutting down.");
         manager.view.setOnSettled(onSettled);
         unsubStatus?.();
         unsubStatus = manager.view.subscribe(() => updateWidget(manager));
@@ -99,18 +104,21 @@ export default function (pi: ExtensionAPI) {
         ui.setWidget(WIDGET_KEY, undefined);
         return;
       }
-      ui.setWidget(WIDGET_KEY, (_tui, theme) => {
-        const line =
-          theme.fg("warning", "■ ") +
-          theme.fg(
-            "text",
-            `${running} background terminal${running === 1 ? "" : "s"} running`,
-          ) +
-          theme.fg("dim", " • ") +
-          theme.fg("accent", "/ps") +
-          theme.fg("dim", " to view");
-        return { render: () => [line], invalidate: () => {} };
-      });
+      ui.setWidget(WIDGET_KEY, (_tui, theme) => ({
+        render(width) {
+          const line =
+            theme.fg("warning", "■ ") +
+            theme.fg(
+              "text",
+              `${running} background terminal${running === 1 ? "" : "s"} running`,
+            ) +
+            theme.fg("dim", " • ") +
+            theme.fg("accent", "/ps") +
+            theme.fg("dim", " to view");
+          return [width <= 0 ? "" : truncateToWidth(line, width)];
+        },
+        invalidate() {},
+      }));
     } catch {
       // UI may be unavailable (print/RPC modes or teardown).
     }
@@ -152,14 +160,10 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
-  const onSettled = (snap: TerminalSnapshot, consumed: boolean) => {
-    if (consumed) {
-      // An in-flight bg_kill is returning this settlement itself.
-      resultDelivery.consume([snap.id]);
-      return;
-    }
-    // Defer a deep-enough copy: the live snapshot's output views keep
-    // mutating (late flushes) after settle.
+  const onSettled = (snap: TerminalSnapshot) => {
+    // A kill waiter is only a provisional collector: it may be aborted before
+    // returning any output. Retain this result until an actual tool response
+    // consumes it. Delivery holds keep in-flight collectors from duplicating it.
     resultDelivery.defer({
       ...snap,
       stdout: { ...snap.stdout },
@@ -184,6 +188,7 @@ export default function (pi: ExtensionAPI) {
   // disposeAll → every entry scope → SIGTERM→SIGKILL tree kill, each close
   // bounded so a wedged process cannot hang shutdown.
   pi.on("session_shutdown", async () => {
+    disposed = true;
     sessionContext = undefined;
     resultDelivery.clear();
     unsubStatus?.();
@@ -332,28 +337,33 @@ export default function (pi: ExtensionAPI) {
         );
       }
 
-      const report = await runTool(getRuntime(), manager.kill(ids), {
-        signal,
-        interruptMessage:
-          "Kill wait aborted; termination continues in the background.",
-      });
-
-      // Settlement may have happened before this kill began (or during it,
-      // via the killInterest consumed flag). Remove any deferred automatic
-      // delivery now that this tool returns the final state itself.
-      resultDelivery.consume(ids);
-
-      return {
-        content: [{ type: "text", text: buildKillReport(report) }],
-        details: {
-          results: report.map((entry) => ({
-            id: entry.id,
-            title: entry.title,
-            status: entry.status,
-            killed: entry.killed,
-          })),
-        },
-      };
+      resultDelivery.hold(ids);
+      try {
+        const report = await runTool(getRuntime(), manager.kill(ids), {
+          signal,
+          interruptMessage:
+            "Kill wait aborted; termination continues in the background.",
+        });
+        const result = {
+          content: [{ type: "text" as const, text: buildKillReport(report) }],
+          details: {
+            results: report.map((entry) => ({
+              id: entry.id,
+              title: entry.title,
+              status: entry.status,
+              killed: entry.killed,
+            })),
+          },
+        };
+        // Acknowledge only after collecting AND formatting the final output.
+        resultDelivery.consume(ids);
+        return result;
+      } finally {
+        // An interrupted collector leaves results available for notification;
+        // overlapping collectors keep their own holds until they finish.
+        resultDelivery.release(ids);
+        if (sessionContext?.isIdle()) flushResults();
+      }
     },
   });
 

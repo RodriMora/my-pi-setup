@@ -82,6 +82,7 @@ it("fd args: out-of-range values are clamped", () => {
 
 it("rg args: defaults use smart-case and safe separators", () => {
   assert.deepEqual(buildRgArgs({ pattern: "--help" }), [
+    "--no-config",
     "--line-number",
     "--color=never",
     "--no-heading",
@@ -107,6 +108,7 @@ it("rg args: all options are translated", () => {
     limit: 10,
   });
   assert.deepEqual(args, [
+    "--no-config",
     "--line-number",
     "--color=never",
     "--no-heading",

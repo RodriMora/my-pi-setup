@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { OutputView, TerminalSnapshot } from "./src/domain.ts";
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@earendil-works/pi-coding-agent";
 import {
   BG_START_PARAMETER_DESCRIPTIONS,
   BG_START_TOOL_DESCRIPTION,
@@ -73,6 +74,39 @@ test("kill report distinguishes killed / raced natural exit / already settled", 
   assert.match(lines[2], /was already failed \(exit 1\)/);
 });
 
+test("kill report includes bounded final stdout/stderr and full-log pointers", () => {
+  const stdout = "early output\n".repeat(2_000) + "FINAL STDOUT";
+  const report = buildKillReport([{
+    id: "bt-1", title: "test", status: "killed", wasRunning: true, killed: true, exit: "SIGTERM",
+    snapshot: snap({
+      stdout: view({ text: stdout, totalBytes: Buffer.byteLength(stdout), spillPath: "/tmp/full.stdout.log" }),
+      stderr: view({ text: "FINAL STDERR", totalBytes: 12 }),
+    }),
+  }]);
+  assert.match(report, /FINAL STDOUT/);
+  assert.match(report, /FINAL STDERR/);
+  assert.match(report, /stdout truncated/);
+  assert.match(report, /Full log: \/tmp\/full.stdout.log/);
+  assert.ok(Buffer.byteLength(report) <= DEFAULT_MAX_BYTES);
+});
+
+test("multi-terminal kill output respects aggregate limits and keeps all status lines", () => {
+  const text = "x".repeat(100_000) + "END";
+  const report = buildKillReport(Array.from({ length: 32 }, (_, index) => ({
+    id: `bt-${index + 1}`, title: "test", status: "killed" as const,
+    wasRunning: true, killed: true, exit: "SIGTERM",
+    snapshot: snap({
+      errorText: "warning ".repeat(500),
+      stdout: view({ text, totalBytes: text.length, spillPath: `/tmp/${index}.stdout.log` }),
+      stderr: view({ text, totalBytes: text.length, spillPath: `/tmp/${index}.stderr.log` }),
+    }),
+  })));
+  for (let index = 1; index <= 32; index++) assert.ok(report.includes(`Killed bt-${index} `));
+  assert.ok(Buffer.byteLength(report) <= DEFAULT_MAX_BYTES);
+  assert.ok(report.split("\n").length <= DEFAULT_MAX_LINES);
+  assert.match(report, /Kill report truncated/);
+});
+
 test("status result marks head-truncated output with a pointer at the full log", () => {
   const text = buildStatusResult(
     snap({
@@ -86,6 +120,14 @@ test("status result marks head-truncated output with a pointer at the full log",
   );
   assert.match(text, /stdout truncated: showing last /);
   assert.match(text, /Full log: \/tmp\/bt-1\.stdout\.log/);
+});
+
+test("a missing spill does not promise full output that was already discarded", () => {
+  const report = buildStatusResult(snap({
+    stdout: view({ text: "retained tail", totalBytes: 100_000, truncatedBytes: 99_987 }),
+  }));
+  assert.match(report, /older output was not preserved/);
+  assert.doesNotMatch(report, /Full output in/);
 });
 
 test("completion message reports kill vs exit and omits empty stderr", () => {

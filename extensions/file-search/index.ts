@@ -261,10 +261,28 @@ export default function fileSearchTools(pi: ExtensionAPI) {
       return new Text(text, 0, 0);
     },
 
-    renderResult(result, { expanded, isPartial }, theme) {
+    renderResult(result, { expanded, isPartial }, theme, context) {
+      if (context.isError) {
+        return renderTextResult(
+          result,
+          expanded,
+          theme,
+          "error",
+          "fd search failed.",
+        );
+      }
       if (isPartial) return new Text(theme.fg("warning", "Searching..."), 0, 0);
       const details = result.details;
-      if (!details || details.matchCount === 0) {
+      if (!details) {
+        return renderTextResult(
+          result,
+          expanded,
+          theme,
+          "dim",
+          "Search completed without result details.",
+        );
+      }
+      if (details.matchCount === 0) {
         return new Text(theme.fg("dim", "No files found"), 0, 0);
       }
       let text = theme.fg(
@@ -332,10 +350,28 @@ export default function fileSearchTools(pi: ExtensionAPI) {
       return new Text(text, 0, 0);
     },
 
-    renderResult(result, { expanded, isPartial }, theme) {
+    renderResult(result, { expanded, isPartial }, theme, context) {
+      if (context.isError) {
+        return renderTextResult(
+          result,
+          expanded,
+          theme,
+          "error",
+          "rg search failed.",
+        );
+      }
       if (isPartial) return new Text(theme.fg("warning", "Searching..."), 0, 0);
       const details = result.details;
-      if (!details || details.outputLines === 0) {
+      if (!details) {
+        return renderTextResult(
+          result,
+          expanded,
+          theme,
+          "dim",
+          "Search completed without result details.",
+        );
+      }
+      if (details.outputLines === 0) {
         return new Text(theme.fg("dim", "No matches found"), 0, 0);
       }
       let text = theme.fg(
@@ -354,6 +390,27 @@ const PREVIEW_LINES = 20;
 
 interface ThemeLike {
   fg(color: string, text: string): string;
+}
+
+/** Host-generated failures (validation, cancellation, setup) often lack details. */
+function renderTextResult(
+  result: { content: { type: string; text?: string }[] },
+  expanded: boolean,
+  theme: ThemeLike,
+  color: "error" | "dim",
+  fallback: string,
+) {
+  const text = result.content
+    .filter((block) => block.type === "text" && block.text)
+    .map((block) => block.text)
+    .join("\n");
+  const lines = (text.trim() ? text : fallback).split("\n");
+  const limit = expanded ? PREVIEW_LINES : 3;
+  let preview = theme.fg(color, lines.slice(0, limit).join("\n"));
+  if (lines.length > limit) {
+    preview += `\n${theme.fg("muted", `... ${lines.length - limit} more lines`)}`;
+  }
+  return new Text(preview, 0, 0);
 }
 
 function expandedPreview(

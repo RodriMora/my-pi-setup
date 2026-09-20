@@ -10,12 +10,13 @@ export interface ModelInfoState {
   contextTokens: number | null;
   contextWindow: number;
   contextPercent: number | null;
+  /** Whole-session recorded cost, including nested/summary usage and recorded title attempts. */
   cost: number;
   tokensPerSecond: number | null;
   generating: boolean;
   /** Short summary of what the session is about, derived from the first message. */
   summary: string | null;
-  /** True while the summary is being generated (fires with the first user message). */
+  /** True while a bounded TUI-only title request is in progress. */
   summarizing: boolean;
 }
 

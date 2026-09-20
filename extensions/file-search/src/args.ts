@@ -2,7 +2,7 @@
  * Pure CLI argument construction for the fd and rg tools.
  *
  * Everything here is synchronous and side-effect free so the exact argv
- * passed to pi.exec can be asserted in tests. Patterns are always placed
+ * passed to the search process can be asserted in tests. Patterns are placed
  * after a `--` separator so user-controlled input can never be parsed as a
  * flag, and paths are normalized (leading `@`, `~` expansion) before use.
  */
@@ -94,6 +94,9 @@ export interface RgToolParams {
 
 export function buildRgArgs(params: RgToolParams) {
   const args = [
+    // A user's interactive rg config can silently change tool semantics (e.g.
+    // --quiet, --files, --replace). Keep this tool's argv authoritative.
+    "--no-config",
     "--line-number",
     "--color=never",
     "--no-heading",
