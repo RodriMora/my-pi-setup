@@ -6,23 +6,30 @@ All lines fit the available width; visible rows adapt to terminal height.
 
 ## What the checkboxes mean
 
-- **[x] / [ ]:** this file is allowed/excluded by **global local-skill filters**.
-- **[-]:** a loaded project, package, CLI, extension-provided, or otherwise
-  non-global resource. It is read-only here; use `pi config` or its source's config.
-- The selected row shows its absolute path and whether it is **currently loaded**.
-  Allowed does not necessarily mean loaded: a same-name skill can shadow it, or
-  discovery can be disabled. Files with duplicate names remain separate rows.
+Every row is toggleable unless marked `[-]`; the save target depends on where the
+skill comes from:
 
-This distinction matters: Pi's global `settings.skills` overrides are not universal
-session-wide switches. Writing a global exclusion for a package/project skill can
-silently do nothing. The picker does not promise otherwise.
+- **[x] / [ ] user skills:** allowed/excluded via **global local-skill filters**
+  (`~/.pi/agent/settings.json` `skills` entries).
+- **[x] / [ ] project skills** (`.pi/skills`, `.agents/skills` under the cwd):
+  toggled through the **project's** `.pi/settings.json` `skills` overrides, never
+  the global ones.
+- **[x] / [ ] package skills:** toggled through the owning package's filter entry
+  in `settings.packages` (plain string sources are converted to
+  `{ source, skills: [...] }`; a fully emptied filter collapses back to a string).
+- **[-]:** CLI-provided or extension-registered resources whose on/off state
+  cannot be persisted to any settings file. Read-only here.
+
+The selected row shows its absolute path and where its toggle is saved. Allowed
+does not necessarily mean loaded: a same-name skill can shadow it, or discovery
+can be disabled. Files with duplicate names remain separate rows.
 
 ## Safe settings updates
 
 The picker resolves the settings directory with `getAgentDir()`, including
-`PI_CODING_AGENT_DIR`. Only user-toggled, writable rows produce changes. Saving
-without changes preserves existing file bytes; positive external discovery entries
-are never removed. Unrelated settings, filters, and other writers' changes survive.
+`PI_CODING_AGENT_DIR`. Only user-toggled rows produce changes. Saving without
+changes preserves existing file bytes. Unrelated settings, filters, and other
+writers' changes survive.
 
 Persistence shares the reviewed writer in `../shared/settings-file.ts` with
 `remember-model`: strict JSON-object validation, read-after-lock merging using
@@ -41,17 +48,22 @@ and existing includes remain intact when disabling.
 **Conservative limitation:** a matching relative `-path` can affect several roots.
 The picker refuses to remove that shared rule to enable one row; refine it to
 absolute exclusions in `settings.json` first. It reports the reason and saves
-nothing, rather than accidentally enabling another file.
+nothing, rather than accidentally enabling another file. Package filters are
+scoped to one package root, so their relative exclusions are unambiguous and this
+guard only applies to global and project filters.
 
 ## Discovery and lifecycle
 
 Discovery is filesystem-only: configured global file/directory paths, the current
-agent directory's `skills/`, `~/.agents/skills`, plus loaded commands' provenance.
-It does not install packages, execute skills, or enumerate disabled package/project
-resources. Directory realpaths prevent symlink cycles; hidden/dependency folders
-and ignore files are respected. Public YAML frontmatter parsing supports multiline
-descriptions. Discovery modes follow installed Pi 0.85.1 (including nested Markdown
-skills in `.agents/skills`); development dependencies remain Pi 0.84.1.
+agent directory's `skills/`, `~/.agents/skills`, the project's `.pi/skills` and
+`.agents/skills`, configured packages' installed roots (manifest `pi.skills`
+entries or a default `skills/` directory), plus loaded commands' provenance.
+It does not install packages, execute skills, or enumerate resources of packages
+whose installed root cannot be found on disk — those appear read-only if loaded.
+Directory realpaths prevent symlink cycles; hidden/dependency folders and ignore
+files are respected. Public YAML frontmatter parsing supports multiline
+descriptions. Discovery modes follow installed Pi 0.86.x (including nested
+Markdown skills in `.agents/skills`).
 
 Only one picker opens per extension instance. Shutdown closes the UI, waits for its
 cleanup, cancels pending lock waits, and prevents stale notifications/reloads.

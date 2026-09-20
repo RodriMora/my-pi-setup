@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import test, { type TestContext } from "node:test";
 import lockfile from "proper-lockfile";
@@ -191,7 +191,7 @@ test("reload failures after shutdown do not touch the stale UI context", bounded
     throw new Error("Old reload frame is stale");
   } });
   assert.equal(f.state.messages.length, 1);
-  assert.match(f.state.messages[0].message, /Saved global skill filters/);
+  assert.match(f.state.messages[0].message, /Saved skill selection/);
 });
 
 test("a second command cannot open an overlapping picker", bounded, async t => {
@@ -205,12 +205,33 @@ test("a second command cannot open an overlapping picker", bounded, async t => {
   await first;
 });
 
-test("package and project rows are read-only and saving does not invent global exclusions", bounded, async t => {
+test("package skill toggles persist into the package's filter entry and reload once", bounded, async t => {
   const f = fixture(t);
   f.state.commands = [{ name: "skill:external", description: "Package-owned", source: "skill", sourceInfo: {
     path: f.external, source: "npm:example", scope: "user", origin: "package", baseDir: f.home,
   } }];
+  fs.writeFileSync(f.settings, JSON.stringify({ ...f.initial, packages: ["do-not-change", "npm:example"] }));
+  // The package's installed root must exist for the picker to offer its skills.
+  fs.mkdirSync(join(f.agentDir, "npm", "node_modules", "example"), { recursive: true });
   f.state.action = picker => { picker.handleInput?.(" "); picker.handleInput?.("\x1b"); };
   await f.handler("", f.ctx);
-  assert.deepEqual(f.read(), f.initial);
+  assert.deepEqual(f.read(), { ...f.initial, packages: ["do-not-change", { source: "npm:example", skills: [`-${f.external}`] }] });
+  assert.equal(f.state.reloads, 1);
+  assert.equal(f.state.messages.filter(m => m.kind === "error").length, 0);
+});
+
+test("project skill toggles persist into the project settings and reload once", bounded, async t => {
+  const f = fixture(t);
+  const projectSkill = join(f.home, ".pi", "skills", "local", "SKILL.md");
+  fs.mkdirSync(dirname(projectSkill), { recursive: true });
+  fs.writeFileSync(projectSkill, "---\nname: local\ndescription: Project skill\n---\n");
+  f.state.commands = [{ name: "skill:local", description: "Project-owned", source: "skill", sourceInfo: {
+    path: projectSkill, source: "auto", scope: "project", origin: "top-level", baseDir: join(f.home, ".pi"),
+  } }];
+  f.state.action = picker => { picker.handleInput?.("\x1b[B"); picker.handleInput?.(" "); picker.handleInput?.("\x1b"); };
+  await f.handler("", f.ctx);
+  assert.deepEqual(f.read(), f.initial, "global settings stay untouched");
+  assert.deepEqual(JSON.parse(fs.readFileSync(join(f.home, ".pi", "settings.json"), "utf8")),
+    { skills: [`-${projectSkill}`] });
+  assert.equal(f.state.reloads, 1);
 });

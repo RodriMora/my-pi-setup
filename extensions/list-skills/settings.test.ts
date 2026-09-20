@@ -308,3 +308,113 @@ test("atomic replacement failure preserves original skill settings and cleans te
 	assert.equal(fs.readFileSync(path, "utf8"), bytes);
 	assert.deepEqual(fs.readdirSync(dir), ["settings.json"]);
 });
+
+function packageFixture(t: TestContext) {
+	const base = fixture(t);
+	const root = join(base.dir, "package-root");
+	fs.mkdirSync(root, { recursive: true });
+	return { ...base, root };
+}
+
+const packageSkill = (root: string, name: string): SkillTarget => ({
+	path: join(root, "skills", name, "SKILL.md"), baseDir: root, auto: false,
+});
+
+const PACKAGE = "npm:example";
+
+test("disabling a package skill converts its string entry into an object filter", async (t) => {
+	const { dir, root, target, write, read } = packageFixture(t);
+	const skill = packageSkill(root, "draft");
+	write({ packages: ["first", PACKAGE, "last"] });
+	await saveSkillChanges(dir, [{ ...skill, enabled: false, control: { kind: "package", source: PACKAGE } }]);
+	assert.deepEqual(read().packages, ["first", { source: PACKAGE, skills: [`-${skill.path}`] }, "last"]);
+});
+
+test("re-enabling a package skill removes the exclusion and collapses back to a plain string", async (t) => {
+	const { dir, root, write, read } = packageFixture(t);
+	const skill = packageSkill(root, "draft");
+	write({ packages: [{ source: PACKAGE, skills: [`-${skill.path}`], autoload: true }] });
+	await saveSkillChanges(dir, [{ ...skill, enabled: true, control: { kind: "package", source: PACKAGE } }]);
+	assert.deepEqual(read().packages, [PACKAGE]);
+});
+
+test("package toggles preserve other object fields and only touch matching exact entries", async (t) => {
+	const { dir, root, write, read } = packageFixture(t);
+	const skill = packageSkill(root, "draft");
+	const other = packageSkill(root, "other");
+	const entry = { source: PACKAGE, skills: [`-${other.path}`, "skills/draft/**", "!**/private/**"], autoload: false };
+	write({ packages: [entry] });
+	// skills/draft/** already includes it: disabling adds a final exact exclusion.
+	await saveSkillChanges(dir, [{ ...skill, enabled: false, control: { kind: "package", source: PACKAGE } }]);
+	assert.deepEqual(read().packages, [{ ...entry, skills: [...entry.skills, `-${skill.path}`] }]);
+	// Re-enabling removes the exact exclusion but keeps the glob and the other skill's exclusion.
+	await saveSkillChanges(dir, [{ ...skill, enabled: true, control: { kind: "package", source: PACKAGE } }]);
+	assert.deepEqual(read().packages, [entry]);
+});
+
+test("package toggles force-include over a broad ! glob when enabling", async (t) => {
+	const { dir, root, write, read } = packageFixture(t);
+	const skill = packageSkill(root, "draft");
+	write({ packages: [{ source: PACKAGE, skills: ["!**"] }] });
+	await saveSkillChanges(dir, [{ ...skill, enabled: true, control: { kind: "package", source: PACKAGE } }]);
+	assert.deepEqual(read().packages, [{ source: PACKAGE, skills: ["!**", `+${skill.path}`] }]);
+});
+
+test("project package entries win over global ones, matching Pi's dedupe", async (t) => {
+	const { dir, root, write, read } = packageFixture(t);
+	const skill = packageSkill(root, "draft");
+	const projectSettings = join(dir, "project", ".pi", "settings.json");
+	fs.mkdirSync(dirname(projectSettings), { recursive: true });
+	write({ packages: [PACKAGE] });
+	fs.writeFileSync(projectSettings, JSON.stringify({ packages: [{ source: PACKAGE, skills: [] }] }));
+	const cwd = join(dir, "project");
+	await saveSkillChanges(dir, [{ ...skill, enabled: false, control: { kind: "package", source: PACKAGE } }], undefined, cwd);
+	assert.deepEqual(JSON.parse(fs.readFileSync(projectSettings, "utf8")).packages,
+		[{ source: PACKAGE, skills: [`-${skill.path}`] }]);
+	assert.deepEqual(read().packages, [PACKAGE]);
+});
+
+for (const packages of [undefined, ["other"], [{ source: PACKAGE, skills: ["draft", 1] }]]) {
+	test(`rejects unusable package configuration ${JSON.stringify(packages)} without destruction`, async (t) => {
+		const { dir, path, root, write } = packageFixture(t);
+		const skill = packageSkill(root, "draft");
+		write({ packages: packages === undefined ? undefined : packages, keep: true });
+		const bytes = fs.readFileSync(path, "utf8");
+		await assert.rejects(
+			saveSkillChanges(dir, [{ ...skill, enabled: false, control: { kind: "package", source: PACKAGE } }]),
+			/Refusing to update|invalid skills filter|was not found/);
+		assert.equal(fs.readFileSync(path, "utf8"), bytes);
+	});
+}
+
+test("unchanged package toggles skip the write entirely", async (t) => {
+	const { dir, path, root, write } = packageFixture(t);
+	const skill = packageSkill(root, "draft");
+	const content = '{"packages":["npm:example"]}\n';
+	fs.writeFileSync(path, content);
+	const rename = t.mock.method(fs, "renameSync");
+	await saveSkillChanges(dir, [{ ...skill, enabled: true, control: { kind: "package", source: PACKAGE } }]);
+	assert.equal(rename.mock.callCount(), 0);
+	assert.equal(fs.readFileSync(path, "utf8"), content);
+});
+
+test("project skill toggles write the project's own settings.json", async (t) => {
+	const { dir, target, write } = fixture(t);
+	const skill = target("example", join(dir, "project", ".pi", "skills"));
+	const projectSettings = join(dir, "project", ".pi", "settings.json");
+	fs.mkdirSync(dirname(projectSettings), { recursive: true });
+	fs.writeFileSync(projectSettings, JSON.stringify({ theme: "keep" }));
+	const cwd = join(dir, "project");
+	await saveSkillChanges(dir, [{ ...skill, enabled: false, control: { kind: "project" } }], undefined, cwd);
+	assert.deepEqual(JSON.parse(fs.readFileSync(projectSettings, "utf8")),
+		{ theme: "keep", skills: [`-${skill.path}`] });
+	await saveSkillChanges(dir, [{ ...skill, enabled: true, control: { kind: "project" } }], undefined, cwd);
+	assert.deepEqual(JSON.parse(fs.readFileSync(projectSettings, "utf8")), { theme: "keep" });
+});
+
+test("project skill toggles without a cwd are rejected", async (t) => {
+	const { dir, target } = fixture(t);
+	await assert.rejects(
+		saveSkillChanges(dir, [{ ...target(), enabled: false, control: { kind: "project" } }]),
+		/without a project directory/);
+});

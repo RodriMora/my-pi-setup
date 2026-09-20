@@ -43,17 +43,20 @@ export class SkillChecklist {
     const help = theme.fg("dim", "↑↓ navigate • space/enter toggle • esc save + reload • ctrl+c cancel");
     let lines: string[];
     if (!selected) {
-      lines = [theme.fg("accent", theme.bold("Global skill filters")), theme.fg("muted", "No skills found"), help];
+      lines = [theme.fg("accent", theme.bold("Skills ([x]/[ ] toggle; [-] read-only)")), theme.fg("muted", "No skills found"), help];
     } else if (height < 7) {
       lines = [row(selected, this.selected), theme.fg("dim", clean(selected.path)), help];
     } else {
-      lines = [theme.fg("accent", theme.bold("Global skill filters ([x] allowed; [-] read-only)")), help, ""];
+      lines = [theme.fg("accent", theme.bold("Skills ([x] on; [ ] off; [-] read-only)")), help, ""];
       const count = height - 6;
       const start = Math.max(0, Math.min(this.selected - Math.floor(count / 2), skills.length - count));
       for (let i = start; i < Math.min(skills.length, start + count); i++) lines.push(row(skills[i], i));
       lines.push(theme.fg("dim", clean(selected.path)));
-      lines.push(theme.fg("muted", clean(selected.reason ?? (selected.loaded
-        ? "Currently loaded in this session" : "Not currently loaded (may be filtered, shadowed, or discovery disabled)"))));
+      lines.push(theme.fg("muted", clean(selected.reason ?? (selected.control?.kind === "package"
+        ? "Toggled through the owning package's filter in settings.json"
+        : selected.control?.kind === "project"
+        ? "Toggled through the project's .pi/settings.json"
+        : selected.loaded ? "Currently loaded in this session" : "Not currently loaded (may be filtered, shadowed, or discovery disabled)"))));
       lines.push(theme.fg("dim", `${this.selected + 1}/${skills.length}`));
     }
     return lines.slice(0, height).map(line => truncateToWidth(line, width, "…"));

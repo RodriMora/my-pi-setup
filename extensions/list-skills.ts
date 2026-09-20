@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
+import { join } from "node:path";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { readSettings } from "./shared/settings-file.ts";
+import { readSettings, readSettingsFile } from "./shared/settings-file.ts";
 import { loadSkillCatalog } from "./list-skills/catalog.ts";
 import { SkillChecklist } from "./list-skills/checklist.ts";
 import { saveSkillChanges } from "./list-skills/settings.ts";
@@ -17,7 +18,7 @@ export default function (pi: ExtensionAPI) {
     await activeUI?.catch(() => {});
   });
   pi.registerCommand("listskills", {
-    description: "Inspect skills and change global local-skill filters (other sources are read-only)",
+    description: "Toggle any skill on/off (user, project, and package skills)",
     handler: async (_args, ctx) => {
       if (lifetime.signal.aborted) return;
       if (ctx.mode !== "tui") {
@@ -34,7 +35,8 @@ export default function (pi: ExtensionAPI) {
         if (lifetime.signal.aborted) return;
         const agentDir = getAgentDir();
         const { skills, warnings } = loadSkillCatalog({
-          agentDir, homeDir: homedir(), settings: readSettings(agentDir), commands: pi.getCommands(),
+          agentDir, homeDir: homedir(), cwd: ctx.cwd, settings: readSettings(agentDir),
+          projectSettings: readSettingsFile(join(ctx.cwd, ".pi", "settings.json")), commands: pi.getCommands(),
         });
         if (warnings.length) ctx.ui.notify(`Some skill paths could not be read: ${warnings[0]}`, "warning");
         let save: boolean;
@@ -55,10 +57,10 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify("Skill changes cancelled", "info");
           return;
         }
-        const changes = skills.filter(skill => skill.managed && skill.enabled !== skill.initialEnabled);
-        await saveSkillChanges(agentDir, changes, lifetime.signal);
+        const changes = skills.filter(skill => skill.control && skill.enabled !== skill.initialEnabled);
+        await saveSkillChanges(agentDir, changes, lifetime.signal, ctx.cwd);
         if (lifetime.signal.aborted) return;
-        ctx.ui.notify("Saved global skill filters; reloading Pi resources…", "info");
+        ctx.ui.notify("Saved skill selection; reloading Pi resources…", "info");
         await ctx.reload();
         return; // Reload invalidates this extension's old context.
       } catch (error) {

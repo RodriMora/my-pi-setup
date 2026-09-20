@@ -37,8 +37,12 @@ function readCurrent(settingsPath: string) {
 }
 
 /** Read a preview without creating files. Saving must re-read under the lock. */
+export function readSettingsFile(settingsPath: string): Settings {
+  return readCurrent(settingsPath).current;
+}
+
 export function readSettings(agentDir: string): Settings {
-  return readCurrent(resolve(agentDir, "settings.json")).current;
+  return readSettingsFile(resolve(agentDir, "settings.json"));
 }
 
 /** Synchronous read/transform/write while holding Pi's settings.json.lock. */
@@ -77,7 +81,15 @@ export async function updateSettings(
   update: (current: Settings) => Settings | undefined,
   signal?: AbortSignal,
 ): Promise<void> {
-  const settingsPath = resolve(agentDir, "settings.json");
+  return updateSettingsFile(resolve(agentDir, "settings.json"), update, signal);
+}
+
+/** Synchronous read/transform/write of one settings file while holding its Pi-style lock. */
+export async function updateSettingsFile(
+  settingsPath: string,
+  update: (current: Settings) => Settings | undefined,
+  signal?: AbortSignal,
+): Promise<void> {
   signal?.throwIfAborted();
   fs.mkdirSync(dirname(settingsPath), { recursive: true, mode: 0o700 });
   for (let attempt = 0; attempt < LOCK_ATTEMPTS; attempt++) {
