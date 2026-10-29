@@ -5,6 +5,8 @@
  * - Serialized inline UI: arrow keys or number keys to pick, Enter to confirm
  * - "Write my own answer" opens an inline editor (Esc returns to the options)
  * - Esc on the options dismisses the question (the model is told you declined)
+ * - RPC hosts (T3 Code) bridge the native select/input dialogs instead of the
+ *   overlay; JSON and print modes have no UI and get explicit guidance
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -30,6 +32,7 @@ import { createQuestionQueue } from "./src/question-queue.ts";
 
 const MIN_OPTIONS = 2;
 const MAX_OPTIONS = 5;
+const OTHER_LABEL = "Write my own answer…";
 
 const OptionSchema = Type.Object({
   label: Type.String({
@@ -115,7 +118,9 @@ export default function askUser(pi: ExtensionAPI) {
         );
       }
 
-      if (ctx.mode !== "tui") {
+      // RPC hosts bridge the native select/input dialogs (pi's rpc-extension-ui
+      // protocol); only modes with neither overlay nor dialogs have no UI.
+      if (ctx.mode !== "tui" && !(ctx.mode === "rpc" && ctx.hasUI)) {
         return reply(buildAskUserResultMessage({ kind: "no-ui" }));
       }
 
@@ -125,8 +130,42 @@ export default function askUser(pi: ExtensionAPI) {
 
       const allOptions: DisplayOption[] = [
         ...params.options,
-        { label: "Write my own answer…", isOther: true },
+        { label: OTHER_LABEL, isOther: true },
       ];
+
+      // Dialog fallback for RPC: pick from a native select; the free-form
+      // option opens a native input. Abort and dismissal both collapse to null
+      // (the question queue maps an aborted uiSignal to a cancelled result).
+      const showQuestionDialogs = async (
+        uiSignal: AbortSignal,
+      ): Promise<SelectionResult | null> => {
+        const displayLabels = [
+          ...params.options.map((o) =>
+            o.description ? `${o.label} (${o.description})` : o.label,
+          ),
+          OTHER_LABEL,
+        ];
+        const choice = await ctx.ui.select(params.question, displayLabels, {
+          signal: uiSignal,
+        });
+        if (choice === undefined || uiSignal.aborted) return null;
+        if (choice === OTHER_LABEL) {
+          const answer = await ctx.ui.input(
+            params.question,
+            "Type your answer…",
+            { signal: uiSignal },
+          );
+          const trimmed = answer?.trim();
+          if (!trimmed || uiSignal.aborted) return null;
+          return { answer: trimmed, wasCustom: true };
+        }
+        const index = displayLabels.indexOf(choice);
+        return {
+          answer: params.options[index]?.label ?? choice,
+          wasCustom: false,
+          index: index + 1,
+        };
+      };
 
       const showQuestion = async (uiSignal: AbortSignal) => {
         let cleanup = () => {};
@@ -340,7 +379,10 @@ export default function askUser(pi: ExtensionAPI) {
         }
       };
 
-      const result = await questions.run(showQuestion, signal);
+      const result = await questions.run(
+        ctx.mode === "tui" ? showQuestion : showQuestionDialogs,
+        signal,
+      );
       if (result === undefined) {
         return reply(buildAskUserResultMessage({ kind: "cancelled" }));
       }

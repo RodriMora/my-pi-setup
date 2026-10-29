@@ -192,7 +192,7 @@ function fixture(t: TestContext, host = new Host()) {
   assert.ok(registered, "extension must register its real tool");
   const tool = registered;
   assert.equal(tool.name, "ask_user");
-  const ctx = { mode: "tui", hasUI: true, ui: { custom: host.custom } } as unknown as ExtensionContext;
+  const ctx = { mode: "tui", hasUI: true, ui: { custom: host.custom, select: async () => undefined, input: async () => undefined } } as unknown as ExtensionContext;
   const controllers: AbortController[] = [];
   const pending: Promise<Result>[] = [];
   t.after(async () => {
@@ -317,15 +317,105 @@ test("invalid number input is ignored and a dialog only settles once", bounds, a
   assert.equal(details(await bounded(promise)).answer, "Alpha");
 });
 
-for (const mode of ["rpc", "print", "json"] as const) {
+for (const mode of ["print", "json"] as const) {
   test(`${mode} returns no-UI guidance without opening custom UI`, bounds, async (t) => {
     const f = fixture(t);
-    const result = await bounded(f.call(input(), undefined, { ...f.ctx, mode, hasUI: mode === "rpc" }));
+    const result = await bounded(f.call(input(), new AbortController(), { ...f.ctx, mode, hasUI: false }));
     assert.match(text(result), /No interactive UI is available/);
     assert.equal(details(result).cancelled, true);
     assert.equal(f.host.openings.length, 0);
   });
 }
+
+function rpcFixture(
+  t: TestContext,
+  dialogs: {
+    select: (title: string, options: string[], opts?: { signal?: AbortSignal }) => Promise<string | undefined>;
+    input?: (title: string, placeholder?: string, opts?: { signal?: AbortSignal }) => Promise<string | undefined>;
+  },
+) {
+  let registered: ToolDefinition | undefined;
+  const fake = {
+    registerTool: ((tool) => { registered = tool as unknown as ToolDefinition; }) satisfies ExtensionAPI["registerTool"],
+    on: (() => {}) as unknown as ExtensionAPI["on"],
+  } satisfies Pick<ExtensionAPI, "registerTool" | "on">;
+  askUser(fake as ExtensionAPI);
+  assert.ok(registered, "extension must register its real tool");
+  const tool = registered;
+  const ctx = {
+    mode: "rpc",
+    hasUI: true,
+    ui: {
+      select: dialogs.select,
+      input: dialogs.input ?? (() => Promise.resolve(undefined)),
+    },
+  } as unknown as ExtensionContext;
+  return {
+    call(params = input(), controller = new AbortController()) {
+      return tool.execute("rpc-call", params, controller.signal, undefined, ctx) as Promise<Result>;
+    },
+  };
+}
+
+test("rpc: select picks a labeled option and preserves its one-based index", bounds, async (t) => {
+  const seen: string[][] = [];
+  const f = rpcFixture(t, {
+    select: async (_title, options) => {
+      seen.push(options);
+      return options[1];
+    },
+  });
+  const result = await bounded(f.call());
+  assert.deepEqual(seen[0], ["Alpha (First choice)", "Beta", "Write my own answer…"]);
+  assert.equal(text(result), "User selected option 2: Beta");
+  assert.deepEqual(details(result), {
+    question: "Pick one?", options: ["Alpha", "Beta"], answer: "Beta",
+    wasCustom: false, cancelled: false, index: 2,
+  });
+});
+
+test("rpc: free-form choice opens the input dialog and trims the answer", bounds, async (t) => {
+  const placeholders: (string | undefined)[] = [];
+  const f = rpcFixture(t, {
+    select: async (_title, options) => options[options.length - 1],
+    input: async (title, placeholder) => {
+      assert.equal(title, "Pick one?");
+      placeholders.push(placeholder);
+      return "  My own answer  ";
+    },
+  });
+  const result = await bounded(f.call());
+  assert.deepEqual(placeholders, ["Type your answer…"]);
+  assert.equal(details(result).answer, "My own answer");
+  assert.equal(details(result).wasCustom, true);
+  assert.equal(details(result).cancelled, false);
+  assert.equal(details(result).index, undefined);
+  assert.match(text(result), /wrote their own answer/);
+});
+
+test("rpc: dismissing select or input reports no answer", bounds, async (t) => {
+  const dismissedSelect = await bounded(
+    rpcFixture(t, { select: async () => undefined }).call(),
+  );
+  assert.match(text(dismissedSelect), /dismissed the question without answering/);
+  assert.equal(details(dismissedSelect).cancelled, true);
+
+  const dismissedInput = await bounded(
+    rpcFixture(t, {
+      select: async (_title, options) => options[options.length - 1],
+      input: async () => undefined,
+    }).call(),
+  );
+  assert.equal(details(dismissedInput).cancelled, true);
+  assert.equal(details(dismissedInput).answer, null);
+});
+
+test("rpc without bridged dialogs keeps no-UI guidance", bounds, async (t) => {
+  const f = fixture(t);
+  const result = await bounded(f.call(input(), new AbortController(), { ...f.ctx, mode: "rpc", hasUI: false }));
+  assert.match(text(result), /No interactive UI is available/);
+  assert.equal(f.host.openings.length, 0);
+});
 
 for (const count of [0, 1, 6]) {
   test(`rejects ${count} model options before touching UI`, bounds, async (t) => {
